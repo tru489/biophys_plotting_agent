@@ -1,0 +1,14 @@
+{
+  "name": "biophys-tools",
+  "owner": {
+    "name": "tru489",
+    "email": "thomasu@mit.edu"
+  },
+  "plugins": [
+    {
+      "name": "biophys-plotting",
+      "source": ".",
+      "description": "Automated plotting of compiled FXM/SMR/Coulter biophysics experiments."
+    }
+  ]
+}

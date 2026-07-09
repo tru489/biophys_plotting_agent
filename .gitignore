@@ -216,3 +216,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# biophys_plotting_agent — project-specific
+# ---------------------------------------------------------------------------
+# Generated analysis artifacts (large data + figures should not live in the plugin repo)
+*.h5
+*.hdf5
+*.pptx
+*_fig/
+*_figures/
+*_data/
+# The bundled toolkit is meant to be COPIED next to a generated driver in the user's
+# analysis dir; don't track stray copies if someone runs a driver inside a clone.
+**/biophys_plot_toolkit_copy.py
+
+# OS / editor cruft (raw data dirs carry macOS sidecars)
+.DS_Store
+._*
+Thumbs.db

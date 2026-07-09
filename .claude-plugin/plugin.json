@@ -1,0 +1,9 @@
+{
+  "name": "biophys-plotting",
+  "version": "0.1.0",
+  "description": "Automated plotting of compiled FXM/SMR/Coulter biophysics experiments — inspects an experiment's annotation schema and generates ridge/box/timecourse/scatter figures.",
+  "author": {
+    "name": "tru489"
+  },
+  "homepage": "https://github.com/tru489/biophys_plotting_agent"
+}
