@@ -72,8 +72,10 @@ If the user has no density plots / no iFXM data, this can be skipped.
    pass the mapping to the loaders** (e.g.
    `tk.load_ifxm(DATA_DIR, baseline_density=BD, condition_col="treatment", time_col="t_hours")`).
    Keep `import biophys_plot_toolkit as tk` — do **not** inline the helpers. Use `scatter_2d` with
-   records from `load_ifxm_paired` (row-aligned) for any volume-vs-mass / volume-vs-density
-   scatter the user wants.
+   records from `load_ifxm_paired` (row-aligned) for any property-vs-property scatter (e.g.
+   mass-vs-density, volume-vs-mass); it renders a per-condition grid of per-sample panels, each a
+   scatter with marginal histograms on both axes. Pass `trim_y="mad"` (or `trim_x`) to tame
+   heavy-tailed axes like density.
 
 ### 4. Run it
 Ensure the deps are available (numpy, pandas, matplotlib, tables/PyTables, python-pptx, Pillow).

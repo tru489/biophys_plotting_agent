@@ -122,7 +122,7 @@ Figures go to `<exp>_fig/`; the deck to `<exp>_figures.pptx`. File names:
 
 ```
 {datatype}_{metric}_{plottype}[_{cond|drug}].png
-{datatype}_{propY}_vs_{propX}_scatter[_{cond}].png
+{datatype}_{propY}_vs_{propX}_{cond}.png     # scatter + marginal histograms, one grid per condition
 ```
 
 - `datatype` ∈ {`coulter`, `ifxm`}

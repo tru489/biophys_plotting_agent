@@ -26,6 +26,7 @@ import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 from matplotlib.patches import Patch
 from matplotlib.transforms import blended_transform_factory
 from pathlib import Path
@@ -173,6 +174,39 @@ def _reject_mad(a: np.ndarray, thresh: float = 3.5) -> np.ndarray:
     if mad == 0:
         return a
     return a[np.abs(0.6745 * (a - med) / mad) <= thresh]
+
+
+# Mask-returning variants (keep two arrays row-aligned when trimming a scatter axis).
+def _mask_3sigma(a: np.ndarray) -> np.ndarray:
+    a = np.asarray(a, float)
+    finite = np.isfinite(a)
+    if finite.sum() == 0:
+        return finite
+    mu, sd = a[finite].mean(), a[finite].std()
+    return finite & (a >= mu - 3 * sd) & (a <= mu + 3 * sd)
+
+
+def _mask_mad(a: np.ndarray, thresh: float = 3.5) -> np.ndarray:
+    a = np.asarray(a, float)
+    finite = np.isfinite(a)
+    if finite.sum() == 0:
+        return finite
+    med = np.median(a[finite])
+    mad = np.median(np.abs(a[finite] - med))
+    if mad == 0:
+        return finite
+    return finite & (np.abs(0.6745 * (a - med) / mad) <= thresh)
+
+
+def _trim_mask(a: np.ndarray, how) -> np.ndarray:
+    """Keep-mask for outlier trimming on one scatter axis. how in {None, 'mad', '3sigma'}."""
+    if how is None:
+        return np.isfinite(np.asarray(a, float))
+    if how == "mad":
+        return _mask_mad(a)
+    if how == "3sigma":
+        return _mask_3sigma(a)
+    raise ValueError(f"unknown trim mode {how!r} (use None, 'mad', or '3sigma')")
 
 
 # ---------------------------------------------------------------------------
@@ -553,21 +587,30 @@ def drug_split(records, prop, ylabel, datatype, fig_dir, drug_colors=None) -> No
 
 
 # ---------------------------------------------------------------------------
-# NEW: 2-D property-vs-property scatter (per-cell)
+# 2-D property-vs-property scatter with marginal histograms (per-cell)
 # ---------------------------------------------------------------------------
 def scatter_2d(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir,
-               cond_colors=None, combined=True, per_condition=True) -> None:
-    """Per-cell scatter of prop_y vs prop_x (e.g. mass vs volume, density vs volume).
+               cond_colors=None, drug_colors=None, trim_x=None, trim_y=None,
+               ncols=4) -> None:
+    """Per-cell scatter of prop_y vs prop_x with marginal histograms — one figure per condition,
+    laid out as a grid of per-sample panels. Each panel is a main scatter with a histogram of
+    prop_x above it and a horizontal histogram of prop_y to its right (nested GridSpec with
+    3:1 / 1:3 ratios). Panels are colored by drug when present, else by condition, and titled per
+    sample. Styled to match density_mass_scatter in the reference analysis.
 
     IMPORTANT: pass records from load_ifxm_paired (not load_ifxm) so prop_x and prop_y are
     row-aligned per cell and equal length. Records where either property is empty or the two
     lengths differ are skipped (with a warning) rather than mis-paired.
 
-    Produces one combined overlay (all conditions, colored by condition) and/or one figure per
-    condition. Files: {datatype}_{prop_y}_vs_{prop_x}_scatter[_{cond}].png
+    trim_x / trim_y ('mad' | '3sigma' | None): reject outliers on that axis, applied jointly so
+    the pair stays aligned. Use trim_y='mad' for density (heavy tails), mirroring the reference.
+
+    Files: {datatype}_{prop_y}_vs_{prop_x}_{cond}.png
     """
     cond_colors = cond_colors or build_color_map(
         sorted(set(r["cond"] for r in records)), COND_COLORS)
+    drug_colors = drug_colors or build_color_map(
+        sorted(set(r["drug"] for r in records if r["drug"])), DRUG_COLORS)
 
     def _xy(r):
         x = np.asarray(r["props"].get(prop_x, []), float)
@@ -578,42 +621,63 @@ def scatter_2d(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir,
             print(f"  WARNING: {r['sample']} {prop_x}/{prop_y} lengths differ "
                   f"({x.size} vs {y.size}) — skipping (did you use load_ifxm_paired?)")
             return None
-        m = np.isfinite(x) & np.isfinite(y)
-        return x[m], y[m]
+        keep = _trim_mask(x, trim_x) & _trim_mask(y, trim_y)
+        if keep.sum() == 0:
+            return None
+        return x[keep], y[keep]
 
     usable = [(r, xy) for r in records if (xy := _xy(r)) is not None]
     if not usable:
         return
 
-    if combined:
-        fig, ax = plt.subplots(figsize=(6, 6))
-        seen = set()
-        for r, (x, y) in usable:
-            c = cond_colors.get(r["cond"], FALLBACK_COLOR)
-            lbl = r["cond"] if r["cond"] not in seen else None
-            seen.add(r["cond"])
-            ax.scatter(x, y, color=c, s=6, alpha=0.15, linewidths=0, label=lbl)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
-        ax.set_title(f"{datatype} {prop_y} vs {prop_x}")
-        leg = ax.legend(frameon=False, fontsize=8, markerscale=3)
-        for lh in leg.legend_handles:
-            lh.set_alpha(1)
-        _save(fig, f"{datatype}_{prop_y}_vs_{prop_x}_scatter.png", fig_dir)
+    for cond in sorted(set(r["cond"] for r, _ in usable)):
+        sub = sorted([ru for ru in usable if ru[0]["cond"] == cond],
+                     key=lambda ru: (ru[0]["time_h"], ru[0]["drug"], ru[0]["rep"]))
+        if not sub:
+            continue
 
-    if per_condition:
-        for cond in sorted(set(r["cond"] for r, _ in usable)):
-            sub = [(r, xy) for r, xy in usable if r["cond"] == cond]
-            if not sub:
-                continue
-            c = cond_colors.get(cond, FALLBACK_COLOR)
-            fig, ax = plt.subplots(figsize=(6, 6))
-            for r, (x, y) in sub:
-                ax.scatter(x, y, color=c, s=6, alpha=0.2, linewidths=0)
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel(ylabel)
-            ax.set_title(f"{datatype} {prop_y} vs {prop_x} — {cond}")
-            _save(fig, f"{datatype}_{prop_y}_vs_{prop_x}_scatter_{cond}.png", fig_dir)
+        n = len(sub)
+        nc = min(n, ncols)
+        nrows = int(np.ceil(n / nc))
+        fig = plt.figure(figsize=(nc * 3.5, nrows * 3.5))
+        outer = gridspec.GridSpec(nrows, nc, figure=fig, hspace=0.55, wspace=0.45)
+
+        for idx, (r, (x, y)) in enumerate(sub):
+            ri, ci = divmod(idx, nc)
+            inner = gridspec.GridSpecFromSubplotSpec(
+                2, 2, subplot_spec=outer[ri, ci],
+                width_ratios=[3, 1], height_ratios=[1, 3],
+                hspace=0.03, wspace=0.03,
+            )
+            ax_sc = fig.add_subplot(inner[1, 0])
+            ax_xh = fig.add_subplot(inner[0, 0], sharex=ax_sc)
+            ax_yh = fig.add_subplot(inner[1, 1], sharey=ax_sc)
+            fig.add_subplot(inner[0, 1]).axis("off")
+
+            c = drug_colors.get(r["drug"], FALLBACK_COLOR) if r["drug"] \
+                else cond_colors.get(cond, FALLBACK_COLOR)
+
+            ax_sc.scatter(x, y, color=c, s=2, alpha=0.3, linewidths=0)
+            ax_xh.hist(x, bins=30, color=c, alpha=0.7)
+            ax_yh.hist(y, bins=30, orientation="horizontal", color=c, alpha=0.7)
+
+            plt.setp(ax_xh.get_xticklabels(), visible=False)
+            plt.setp(ax_yh.get_yticklabels(), visible=False)
+            ax_xh.tick_params(bottom=False)
+            ax_yh.tick_params(left=False)
+            ax_xh.set_title(_full_label(r), fontsize=8)
+            ax_sc.set_xlabel(xlabel, fontsize=7)
+            ax_sc.set_ylabel(ylabel, fontsize=7)
+            ax_sc.tick_params(labelsize=6)
+            ax_xh.tick_params(labelsize=6)
+            ax_yh.tick_params(labelsize=6)
+
+        for idx in range(n, nrows * nc):
+            ri, ci = divmod(idx, nc)
+            fig.add_subplot(outer[ri, ci]).axis("off")
+
+        fig.suptitle(f"{datatype} {prop_y} vs {prop_x} — {cond}", fontsize=11)
+        _save(fig, f"{datatype}_{prop_y}_vs_{prop_x}_{cond}.png", fig_dir)
 
 
 # ---------------------------------------------------------------------------

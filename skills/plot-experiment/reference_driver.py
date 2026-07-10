@@ -33,10 +33,12 @@ BASELINE_DENSITY = 1.008
 COULTER_PROPS = tk.COULTER_PROPS            # [("volume", "Volume (fL)")]
 IFXM_PROPS    = tk.IFXM_PROPS               # mass / density / vol_cal / vol_uncal
 
-# 2-D per-cell scatters (iFXM only). (prop_x, prop_y, xlabel, ylabel)
+# 2-D per-cell scatters with marginal histograms (iFXM only), one figure per condition.
+# (prop_x, prop_y, xlabel, ylabel, trim_y)  — trim_y='mad' tames density's heavy tails.
 SCATTER_PAIRS = [
-    ("vol_cal", "mass",    "Calibrated volume (fL)", "Buoyant mass (pg)"),
-    ("vol_cal", "density", "Calibrated volume (fL)", "Density (g/mL)"),
+    ("mass",    "density", "Buoyant mass (pg)",      "Total density (g/cm^3)", "mad"),
+    ("vol_cal", "mass",    "Calibrated volume (fL)", "Buoyant mass (pg)",      None),
+    ("vol_cal", "density", "Calibrated volume (fL)", "Total density (g/cm^3)", "mad"),
 ]
 
 
@@ -62,8 +64,8 @@ def main() -> None:
         tk.timecourse(ifxm, prop, ylabel, "ifxm", FIG_DIR)
         tk.drug_split(ifxm, prop, ylabel, "ifxm", FIG_DIR)
 
-    for px, py, xl, yl in SCATTER_PAIRS:
-        tk.scatter_2d(ifxm_paired, px, py, xl, yl, "ifxm", FIG_DIR)
+    for px, py, xl, yl, trim_y in SCATTER_PAIRS:
+        tk.scatter_2d(ifxm_paired, px, py, xl, yl, "ifxm", FIG_DIR, trim_y=trim_y)
 
     tk.save_pptx(FIG_DIR, PPTX_OUT)
 
