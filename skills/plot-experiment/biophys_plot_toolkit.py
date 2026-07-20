@@ -1,26 +1,37 @@
 """
 biophys_plot_toolkit — reusable plotting library for compiled FXM/SMR/Coulter experiments.
 
-Ported from the hand-written reference analysis
-  C:/code/scratch/biophys_data_analysis/20260629_fl5_wt-gfpgem_ifxm_analysis/analyze_ifxm_data.py
-and generalized so a short per-experiment driver can load compiled/annotated data and produce
-the standard figure grid without re-deriving any of the plotting internals.
+Ported from a hand-written reference analysis and generalized so a short per-experiment driver can
+load the raw biophys_helpers outputs and produce the standard figure grid without re-deriving the
+plotting internals.
 
-The whole toolkit is organized around a uniform *record* abstraction:
-    {sample, cond, drug, time_h, rep, props: {name: np.ndarray}}
-Every loader emits records of this shape; every plot function consumes them, so plotting code is
-agnostic to whether the data came from Coulter or iFXM.
+Three layers, low -> high:
+  * Loaders           -> records: {sample, props:{name: ndarray}, meta:{col: value, ..., rep}}
+                         `meta` carries EVERY annotation column, so any column can drive plots.
+  * infer_roles       -> classifies each metadata column into a role (boolean / categorical /
+                         time / ordered / continuous / label / structural) so the driver (and
+                         Claude) can decide how to group, compare, order and color the data.
+  * draw_*            -> low-level primitives: draw on a passed-in axis, no semantics.
+  * plot_grouped / compare_groups / timecourse_by / scatter_by / facet / cross_groups
+                      -> mid-level combinators parameterized by WHICH column(s) to use.
+  * build_plan / render_plan / autoplot
+                      -> high-level: infer a plot plan from the roles, show it, execute it.
 
-Data conventions (see references/data_schema.md for the full schema):
-  Coulter — one property "volume" (fL), gated upstream.
-  iFXM    — mass (matched_mass, pg), density (buoyant_density + baseline_density),
-            vol_cal (volume_fL), vol_uncal (volume). Mass gated by bm_gate; the three iFXM
-            properties share a single mask computed on the *uncalibrated* volume.
+The loaders read the RAW biophys_helpers outputs directly (no reorg step):
+  Coulter — annotate_coulter_samples.py's '*_coulter_sample_annotation/' dir (metadata.csv +
+            a single-cell data CSV; columns are samples, rows are per-cell volumes).
+            One property "volume" (fL, gated upstream).
+  iFXM    — compile_experiment.py's '*_compiled/experiment_data.xlsx' (a 'metadata' sheet + one
+            worksheet per sample). Each sample's PAIRED ('pair_') block gives, row-aligned:
+            mass (pair_mass_pg, pg), density (pair_buoyant_density + baseline_density),
+            vol_uncal (pair_volume_au), vol_cal (pair_volume_fL, only when calibrated).
+
+No statistical outlier rejection is applied anywhere — the loaders drop only non-finite (NaN/inf)
+values. The only intentional data exclusions are the metadata-driven gates (bm_gate / ifxm_gate)
+and samples skipped because they lack a paired ('pair_') block.
 
 NOTE on baseline_density: the absolute density baseline is variable between experiments and is
-NOT stored in any data file, so `load_ifxm` REQUIRES it as an explicit argument. There is no
-default — passing nothing raises, by design, so an experiment is never silently plotted against
-the wrong baseline.
+NOT stored in any data file, so `load_ifxm` REQUIRES it as an explicit argument (no default).
 """
 import re
 import numpy as np
@@ -35,17 +46,25 @@ from pathlib import Path
 # Styling defaults (override in the driver if an experiment needs different keys)
 # ---------------------------------------------------------------------------
 COND_COLORS = {
-    "activated":     "#4878d0",
-    "starved":       "#ee854a",
-    "drug_treated":  "#6acc65",
-    "proliferating": "#956cb4",
+    "activated":     "#0072B2",
+    "starved":       "#E69F00",
+    "drug_treated":  "#009E73",
+    "proliferating": "#CC79A7",
 }
 DRUG_COLORS = {  # keys match the lowercased output of _norm_drug
-    "dmso":       "#4878d0",
-    "1um-wnk463": "#ee854a",
-    "2um-zt-1a":  "#6acc65",
+    "dmso":       "#0072B2",
+    "1um-wnk463": "#E69F00",
+    "2um-zt-1a":  "#009E73",
 }
-FALLBACK_COLOR = "#aaaaaa"
+# High-contrast, colorblind-accommodating pair for booleans: [falsey, truthy] (Okabe-Ito).
+BOOL_COLORS = ["#0072B2", "#D55E00"]  # blue (false) vs vermillion (true)
+FALLBACK_COLOR = "#999999"
+
+# Colorblind-safe cycle (Okabe-Ito + a few extensions) for auto-assigning colors to unknown values.
+_AUTO_PALETTE = [
+    "#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9",
+    "#F0E442", "#000000", "#8C613C", "#666666", "#B8C9D0", "#5975A4",
+]
 
 # (prop_key, axis_label) lists — defaults matching the reference experiments.
 COULTER_PROPS = [("volume", "Volume (fL)")]
@@ -61,7 +80,7 @@ _REQUIRED = object()
 
 
 # ---------------------------------------------------------------------------
-# Metadata normalization
+# Value normalization
 # ---------------------------------------------------------------------------
 def _is_blank(x) -> bool:
     return x is None or (isinstance(x, float) and np.isnan(x)) or str(x).strip() == ""
@@ -84,12 +103,39 @@ def _rep(sample_name: str) -> str:
     return f"rep{m.group(1)}" if m else "rep1"
 
 
+# Applied to matching metadata columns at load time (by column name). Overridable per loader.
+# Keeps the reference condition/drug fixups while everything else passes through stripped.
+VALUE_NORMALIZERS = {"condition": _norm_cond, "drug_name": _norm_drug}
+
+
+def _clean_value(v):
+    """Light normalization for a raw metadata cell: blanks -> '', strings stripped, else as-is."""
+    if _is_blank(v):
+        return ""
+    return v.strip() if isinstance(v, str) else v
+
+
+def _build_meta(row, sample, normalizers) -> dict:
+    """The generic annotation bag for one record: every column, lightly normalized, plus rep."""
+    meta = {}
+    for col in row.index:
+        val = _clean_value(row[col])
+        fn = normalizers.get(col)
+        meta[col] = fn(val) if fn else val
+    meta["rep"] = _rep(sample)
+    return meta
+
+
 # ---------------------------------------------------------------------------
-# Robust metadata access — annotation column NAMES vary between experiments, so
-# every column is looked up by a (configurable) name with a graceful fallback.
+# Robust metadata access
 # ---------------------------------------------------------------------------
+def rget(r, col, default=None):
+    """Value of annotation `col` for record `r` (from its meta bag), or `default`."""
+    v = r.get("meta", {}).get(col, default)
+    return default if (col != "rep" and _is_blank(v)) else v
+
+
 def _get(row, col, default=""):
-    """Value of `row[col]`, or `default` if the column is absent/blank."""
     if col and col in row.index and not _is_blank(row[col]):
         return row[col]
     return default
@@ -104,8 +150,8 @@ def _get_float(row, col, default):
 
 
 def _gate_bound(row, col, default):
-    """A gate bound as float, or `default` (±inf) when the column is missing or NaN.
-    This makes a missing/ungated experiment mean 'no cutoff' instead of dropping every cell."""
+    """A gate bound as float, or `default` (±inf) when the column is missing or NaN, so a
+    missing/ungated experiment means 'no cutoff' rather than dropping every cell."""
     if col and col in row.index and not _is_blank(row[col]):
         try:
             return float(row[col])
@@ -122,20 +168,25 @@ def _require_col(meta, col, role):
         )
 
 
-# Colorblind-friendly cycle used to auto-assign colors to unknown condition/drug values.
-_AUTO_PALETTE = [
-    "#4878d0", "#ee854a", "#6acc65", "#956cb4", "#d65f5f", "#82c6e2",
-    "#d5bb67", "#8c613c", "#dc7ec0", "#797979", "#b8c9d0", "#5975a4",
-]
+def _to_floats(values):
+    """Return values as a list of floats if every non-blank value is numeric, else None."""
+    out = []
+    for v in values:
+        if _is_blank(v):
+            continue
+        try:
+            out.append(float(v))
+        except (TypeError, ValueError):
+            return None
+    return out
 
 
+# ---------------------------------------------------------------------------
+# Color maps
+# ---------------------------------------------------------------------------
 def build_color_map(values, base=None):
-    """Return a color map covering every value in `values`.
-
-    Known keys in `base` keep their color; any new/unknown value (a condition or drug name you
-    invented for this experiment) gets the next distinct palette color, so arbitrary annotation
-    values render in different colors instead of all-gray. Order-stable and deterministic.
-    """
+    """Color map covering every value in `values`. Known keys in `base` keep their color; unknown
+    values get the next distinct palette color (deterministic, order-stable)."""
     out = dict(base or {})
     used = set(out.values())
     i = 0
@@ -151,245 +202,541 @@ def build_color_map(values, base=None):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Outlier rejection (for visualization only)
-# ---------------------------------------------------------------------------
-def _reject_3sigma(a: np.ndarray) -> np.ndarray:
-    """Drop points outside mean +/- 3 sigma (applied to the volume properties)."""
-    a = a[np.isfinite(a)]
-    if a.size == 0:
-        return a
-    mu, sd = a.mean(), a.std()
-    return a[(a >= mu - 3 * sd) & (a <= mu + 3 * sd)]
-
-
-def _reject_mad(a: np.ndarray, thresh: float = 3.5) -> np.ndarray:
-    """Drop points by modified z-score |0.6745*(x-median)/MAD| > thresh.
-    Robust to the heavy tails in the density data (applied to density only)."""
-    a = a[np.isfinite(a)]
-    if a.size == 0:
-        return a
-    med = np.median(a)
-    mad = np.median(np.abs(a - med))
-    if mad == 0:
-        return a
-    return a[np.abs(0.6745 * (a - med) / mad) <= thresh]
-
-
-# Mask-returning variants (keep two arrays row-aligned when trimming a scatter axis).
-def _mask_3sigma(a: np.ndarray) -> np.ndarray:
-    a = np.asarray(a, float)
-    finite = np.isfinite(a)
-    if finite.sum() == 0:
-        return finite
-    mu, sd = a[finite].mean(), a[finite].std()
-    return finite & (a >= mu - 3 * sd) & (a <= mu + 3 * sd)
-
-
-def _mask_mad(a: np.ndarray, thresh: float = 3.5) -> np.ndarray:
-    a = np.asarray(a, float)
-    finite = np.isfinite(a)
-    if finite.sum() == 0:
-        return finite
-    med = np.median(a[finite])
-    mad = np.median(np.abs(a[finite] - med))
-    if mad == 0:
-        return finite
-    return finite & (np.abs(0.6745 * (a - med) / mad) <= thresh)
-
-
-def _trim_mask(a: np.ndarray, how) -> np.ndarray:
-    """Keep-mask for outlier trimming on one scatter axis. how in {None, 'mad', '3sigma'}."""
-    if how is None:
-        return np.isfinite(np.asarray(a, float))
-    if how == "mad":
-        return _mask_mad(a)
-    if how == "3sigma":
-        return _mask_3sigma(a)
-    raise ValueError(f"unknown trim mode {how!r} (use None, 'mad', or '3sigma')")
+def color_map_for(records, col, roles=None, base=None):
+    """Color map for the values of `col` present in `records`. Booleans get the high-contrast
+    BOOL_COLORS pair; `condition`/`drug`-named columns seed from COND_COLORS / DRUG_COLORS."""
+    role = _role_for(records, col, roles)
+    values = group_order(records, col, roles)
+    if role["role"] == "boolean" and len(values) <= 2:
+        # falsey -> BOOL_COLORS[0], truthy -> BOOL_COLORS[1] (values already ordered falsey->truthy)
+        return {v: BOOL_COLORS[i] for i, v in enumerate(values)}
+    if base is None:
+        if col == "condition":
+            base = COND_COLORS
+        elif "drug" in col.lower():
+            base = DRUG_COLORS
+    return build_color_map(values, base)
 
 
 # ---------------------------------------------------------------------------
-# Loaders  ->  list of records {sample, cond, drug, time_h, rep, props:{name: arr}}
+# Loaders  ->  list of records {sample, props:{name: arr}, meta:{col: value, ..., rep}}
 # ---------------------------------------------------------------------------
-def load_coulter(data_dir, *, sample_col="sample_name", key_col="h5_key",
-                 condition_col="condition", time_col="time_h", drug_col="drug_name",
-                 normalize_cond=_norm_cond, normalize_drug=_norm_drug) -> list:
-    """Load Coulter single-cell volumes from <data_dir>/coulter/{metadata.csv, data.h5}.
 
-    Column names are configurable because annotation schemas vary between experiments. Only
-    `sample_col` is required; if `key_col` is absent it falls back to the sample column, and a
-    missing `condition_col` / `time_col` / `drug_col` degrades gracefully (condition -> unnamed
-    group, time -> 0.0, drug -> none). Pass `normalize_cond`/`normalize_drug=lambda x: x` to
-    disable the default value fixups.
+# Columns inside the PAIRED ('pair_'-prefixed) block of each iFXM sample sheet, after the 'pair_'
+# prefix is stripped. This is the compile_experiment.py output contract (_build_paired_block).
+_PAIR_MASS = "mass_pg"          # buoyant mass (pg)          (was 'matched_mass' in the old h5)
+_PAIR_DENS = "buoyant_density"  # RELATIVE density (g/mL); absolute = + baseline_density
+_PAIR_VUN  = "volume_au"        # uncalibrated volume (AU)   (was 'volume' in the old h5)
+_PAIR_VCAL = "volume_fL"        # calibrated volume (fL); present ONLY when a calibration ran
 
-    Each /data/{key} table's first column is the per-cell volume (fL) array.
+
+def _find_coulter_data_csv(d: Path, meta_path: Path) -> Path:
+    """The single-cell data CSV keeps the input file's name, so it is the one CSV in the
+    directory that is not metadata.csv. Raise clearly if it is ambiguous or missing."""
+    csvs = [p for p in sorted(d.glob("*.csv")) if p.resolve() != meta_path.resolve()]
+    if len(csvs) == 1:
+        return csvs[0]
+    if not csvs:
+        raise FileNotFoundError(
+            f"no single-cell data CSV found in {d} (only metadata.csv). Pass data_file=.")
+    raise ValueError(
+        f"multiple candidate data CSVs in {d}: {[p.name for p in csvs]}; pass data_file= to pick one.")
+
+
+def load_coulter(coulter_dir, *, sample_col="sample_name", data_file=None,
+                 normalizers=VALUE_NORMALIZERS) -> list:
+    """Load Coulter single-cell volumes from a '*_coulter_sample_annotation/' directory produced
+    by annotate_coulter_samples.py (or point straight at its metadata.csv).
+
+    metadata.csv has `sample_name` plus whatever annotation columns were hand-added. The per-cell
+    data is a separate CSV whose COLUMNS are samples (headers == sample_name values) and whose ROWS
+    are single-cell volumes; it is auto-located as the non-metadata CSV in the dir (`data_file`
+    overrides). Volume units follow the input CSV (fL in the standard Coulter pipeline).
+
+    Every metadata column is carried into each record's `meta` bag (role assignment happens later
+    via infer_roles), so only `sample_col` is required.
     """
-    d = Path(data_dir) / "coulter"
-    h5 = d / "data.h5"
-    meta = pd.read_csv(d / "metadata.csv")
+    p = Path(coulter_dir)
+    if p.is_file():
+        meta_path, d = p, p.parent
+    else:
+        meta_path, d = p / "metadata.csv", p
+    if not meta_path.exists():
+        raise FileNotFoundError(
+            f"metadata.csv not found at {meta_path}. Point load_coulter at the "
+            f"'*_coulter_sample_annotation/' directory from annotate_coulter_samples.py.")
+    meta = pd.read_csv(meta_path)
     _require_col(meta, sample_col, "sample-name")
-    key_col = key_col if key_col in meta.columns else sample_col
+
+    data_path = Path(data_file) if data_file else _find_coulter_data_csv(d, meta_path)
+    data = pd.read_csv(data_path)
 
     recs = []
     for _, r in meta.iterrows():
-        arr = pd.read_hdf(h5, f"/data/{r[key_col]}").iloc[:, 0].to_numpy()
-        arr = _reject_3sigma(arr)  # volume plot -> 3-sigma outlier rejection
         sample = _get(r, sample_col, "")
+        if sample not in data.columns:
+            raise KeyError(
+                f"sample {sample!r} has no column in {data_path.name}. "
+                f"Data columns: {list(data.columns)[:12]}{' ...' if data.shape[1] > 12 else ''}")
+        arr = data[sample].to_numpy(dtype=float)
+        arr = arr[np.isfinite(arr)]  # drop NaN padding / non-finite; no statistical outlier rejection
         recs.append({
             "sample": sample,
-            "cond":   normalize_cond(_get(r, condition_col, "")),
-            "drug":   normalize_drug(_get(r, drug_col, "")),
-            "time_h": _get_float(r, time_col, 0.0),
-            "rep":    _rep(sample),
             "props":  {"volume": arr},
+            "meta":   _build_meta(r, sample, normalizers),
         })
     return recs
 
 
-def load_ifxm(data_dir, baseline_density=_REQUIRED, *, sample_col="sample_name",
-              key_col="hdf5_key", condition_col="condition", time_col="time_h",
-              drug_col="drug_name", bm_lower_col="bm_gate_lower", bm_upper_col="bm_gate_upper",
-              ifxm_lower_col="ifxm_gate_lower", ifxm_upper_col="ifxm_gate_upper",
-              normalize_cond=_norm_cond, normalize_drug=_norm_drug) -> list:
-    """Load paired iFXM data from <data_dir>/ifxm/experiment_data.h5.
+def _open_ifxm_xlsx(compiled_dir) -> Path:
+    """Resolve experiment_data.xlsx from a '*_compiled/' dir (or accept the .xlsx path directly)."""
+    p = Path(compiled_dir)
+    xlsx = p if p.suffix.lower() == ".xlsx" else p / "experiment_data.xlsx"
+    if not xlsx.exists():
+        raise FileNotFoundError(
+            f"experiment_data.xlsx not found at {xlsx}. Point load_ifxm at the "
+            f"'*_compiled/' directory produced by compile_experiment.py.")
+    return xlsx
 
-    baseline_density (REQUIRED): fluid baseline added to measured buoyant_density to get the
-    absolute density (g/mL). It varies per experiment and is not stored in the data, so it must
-    be supplied explicitly.
 
-    Annotation/gate column names are configurable (schemas vary between experiments). Only
-    `sample_col` is required; `key_col` falls back to the sample column if absent, and any
-    missing annotation or gate column degrades gracefully (missing gate -> unbounded, i.e. no
-    cutoff, rather than dropping every cell).
+def _read_paired_block(xls, xlsx_path: Path, sheet_name) -> pd.DataFrame:
+    """PAIRED block of one sample sheet as a DataFrame (row-aligned per cell, 'pair_' prefix
+    stripped), or None if the sample has no paired data. A block that overflowed Excel's row limit
+    is written by compile_experiment.py to a sibling '{sheet}_pair_overflow.csv'; prefer it."""
+    overflow = Path(xlsx_path).parent / f"{sheet_name}_pair_overflow.csv"
+    if overflow.exists():
+        blk = pd.read_csv(overflow)
+    else:
+        sheet = pd.read_excel(xls, sheet_name=sheet_name)
+        blk = sheet.filter(regex=r"^pair_").dropna(how="all")
+    if blk.empty:
+        return None
+    blk = blk.rename(columns=lambda c: c[len("pair_"):] if str(c).startswith("pair_") else c)
+    return blk
 
-    Per sample, reads /samples/{key}/pairing (matched_mass, buoyant_density, volume) and
-    /samples/{key}/volume_calibrated (volume_fL). Samples missing either subtable are skipped
-    (e.g. a no-iFXM proliferating control). Mass is gated by the bm gate; the three iFXM
-    properties share one mask computed on the uncalibrated volume (cells are row-aligned).
-    """
+
+def _load_ifxm_records(compiled_dir, baseline_density, sample_col, sheet_col, gate_cols,
+                       normalizers, paired):
+    """Shared iFXM reader. `paired`=True keeps all props row-aligned under one mask (for scatter);
+    False gates mass and the volume props with separate masks (per-property arrays may differ)."""
     if baseline_density is _REQUIRED:
         raise ValueError(
             "load_ifxm requires baseline_density (g/mL) — it varies per experiment and is not "
-            "stored in the data files. Set it explicitly at the top of your driver."
-        )
-
-    h5 = Path(data_dir) / "ifxm" / "experiment_data.h5"
-    meta = pd.read_hdf(h5, "/metadata")
-    _require_col(meta, sample_col, "sample-name")
-    key_col = key_col if key_col in meta.columns else sample_col
-
+            "stored in the data files. Set it explicitly at the top of your driver.")
+    bm_lo_c, bm_hi_c, ix_lo_c, ix_hi_c = gate_cols
+    xlsx = _open_ifxm_xlsx(compiled_dir)
     recs = []
-    with pd.HDFStore(h5, "r") as store:
+    with pd.ExcelFile(xlsx) as xls:
+        meta = pd.read_excel(xls, sheet_name="metadata")
+        _require_col(meta, sample_col, "sample-name")
+        skey = sheet_col if sheet_col in meta.columns else sample_col
+
         for _, r in meta.iterrows():
-            base = f"/samples/{r[key_col]}"
-            if f"{base}/pairing" not in store or f"{base}/volume_calibrated" not in store:
-                continue  # e.g. proliferating_culture_noifxm has no paired iFXM data
-            pr = store[f"{base}/pairing"]
-            vc = store[f"{base}/volume_calibrated"]
+            blk = _read_paired_block(xls, xlsx, r[skey])
+            if blk is None or _PAIR_MASS not in blk.columns or _PAIR_VUN not in blk.columns:
+                continue  # no usable paired iFXM data for this sample
+            mass = blk[_PAIR_MASS].to_numpy(dtype=float)
+            dens = blk[_PAIR_DENS].to_numpy(dtype=float) + baseline_density
+            vun  = blk[_PAIR_VUN].to_numpy(dtype=float)
+            has_cal = _PAIR_VCAL in blk.columns
+            vcal = blk[_PAIR_VCAL].to_numpy(dtype=float) if has_cal else np.array([], dtype=float)
 
-            mass = pr["matched_mass"].to_numpy()
-            dens = pr["buoyant_density"].to_numpy() + baseline_density
-            vun  = pr["volume"].to_numpy()
-            vcal = vc["volume_fL"].to_numpy()
-
-            bm_lo = _gate_bound(r, bm_lower_col, -np.inf)
-            bm_hi = _gate_bound(r, bm_upper_col,  np.inf)
-            ix_lo = _gate_bound(r, ifxm_lower_col, -np.inf)
-            ix_hi = _gate_bound(r, ifxm_upper_col,  np.inf)
-            bm_mask = np.isfinite(mass) & (mass >= bm_lo) & (mass <= bm_hi)
-            # one logical mask from the uncalibrated volume, shared across the paired properties
-            ifxm_mask = np.isfinite(vun) & (vun >= ix_lo) & (vun <= ix_hi)
-
-            def clean(a, m):
-                a = a[m]
-                return a[np.isfinite(a)]
+            bm_lo = _gate_bound(r, bm_lo_c, -np.inf)
+            bm_hi = _gate_bound(r, bm_hi_c,  np.inf)
+            ix_lo = _gate_bound(r, ix_lo_c, -np.inf)
+            ix_hi = _gate_bound(r, ix_hi_c,  np.inf)
 
             sample = _get(r, sample_col, "")
-            recs.append({
-                "sample": sample,
-                "cond":   normalize_cond(_get(r, condition_col, "")),
-                "drug":   normalize_drug(_get(r, drug_col, "")),
-                "time_h": _get_float(r, time_col, 0.0),
-                "rep":    _rep(sample),
-                "props": {
-                    "mass":      clean(mass, bm_mask),
-                    # density plot -> MAD-based outlier rejection for visualization
-                    "density":   _reject_mad(clean(dens, ifxm_mask)),
-                    # volume plots -> additional 3-sigma outlier rejection
-                    "vol_cal":   _reject_3sigma(clean(vcal, ifxm_mask)),
-                    "vol_uncal": _reject_3sigma(clean(vun, ifxm_mask)),
-                },
-            })
-    return recs
+            meta_bag = _build_meta(r, sample, normalizers)
 
-
-def load_ifxm_paired(data_dir, baseline_density=_REQUIRED, *, sample_col="sample_name",
-                     key_col="hdf5_key", condition_col="condition", time_col="time_h",
-                     drug_col="drug_name", bm_lower_col="bm_gate_lower",
-                     bm_upper_col="bm_gate_upper", ifxm_lower_col="ifxm_gate_lower",
-                     ifxm_upper_col="ifxm_gate_upper",
-                     normalize_cond=_norm_cond, normalize_drug=_norm_drug) -> list:
-    """Like load_ifxm, but keeps per-cell arrays row-ALIGNED across properties (no per-property
-    outlier rejection, which would desync lengths). Use this for scatter_2d so a cell's mass,
-    density and volume stay paired. One shared finite+gate mask is applied to every property.
-    Takes the same configurable column names as load_ifxm.
-
-    Returns records whose props hold equal-length arrays for: mass, density, vol_cal, vol_uncal.
-    """
-    if baseline_density is _REQUIRED:
-        raise ValueError("load_ifxm_paired requires baseline_density (g/mL). Set it in your driver.")
-
-    h5 = Path(data_dir) / "ifxm" / "experiment_data.h5"
-    meta = pd.read_hdf(h5, "/metadata")
-    _require_col(meta, sample_col, "sample-name")
-    key_col = key_col if key_col in meta.columns else sample_col
-
-    recs = []
-    with pd.HDFStore(h5, "r") as store:
-        for _, r in meta.iterrows():
-            base = f"/samples/{r[key_col]}"
-            if f"{base}/pairing" not in store or f"{base}/volume_calibrated" not in store:
-                continue
-            pr = store[f"{base}/pairing"]
-            vc = store[f"{base}/volume_calibrated"]
-
-            mass = pr["matched_mass"].to_numpy()
-            dens = pr["buoyant_density"].to_numpy() + baseline_density
-            vun  = pr["volume"].to_numpy()
-            vcal = vc["volume_fL"].to_numpy()
-
-            bm_lo = _gate_bound(r, bm_lower_col, -np.inf)
-            bm_hi = _gate_bound(r, bm_upper_col,  np.inf)
-            ix_lo = _gate_bound(r, ifxm_lower_col, -np.inf)
-            ix_hi = _gate_bound(r, ifxm_upper_col,  np.inf)
-            # single mask keeps every property the same length and row-aligned per cell
-            mask = (np.isfinite(mass) & np.isfinite(dens) & np.isfinite(vun) & np.isfinite(vcal)
-                    & (mass >= bm_lo) & (mass <= bm_hi)
-                    & (vun >= ix_lo) & (vun <= ix_hi))
-
-            sample = _get(r, sample_col, "")
-            recs.append({
-                "sample": sample,
-                "cond":   normalize_cond(_get(r, condition_col, "")),
-                "drug":   normalize_drug(_get(r, drug_col, "")),
-                "time_h": _get_float(r, time_col, 0.0),
-                "rep":    _rep(sample),
-                "props": {
+            if paired:
+                # single mask over always-present props keeps them length-matched & row-aligned;
+                # vcal (finite wherever volume_au is) rides along under the same mask.
+                mask = (np.isfinite(mass) & np.isfinite(dens) & np.isfinite(vun)
+                        & (mass >= bm_lo) & (mass <= bm_hi)
+                        & (vun >= ix_lo) & (vun <= ix_hi))
+                props = {
                     "mass":      mass[mask],
                     "density":   dens[mask],
-                    "vol_cal":   vcal[mask],
+                    "vol_cal":   vcal[mask] if has_cal else np.array([], dtype=float),
                     "vol_uncal": vun[mask],
-                },
-            })
+                }
+            else:
+                bm_mask = np.isfinite(mass) & (mass >= bm_lo) & (mass <= bm_hi)
+                ifxm_mask = np.isfinite(vun) & (vun >= ix_lo) & (vun <= ix_hi)
+
+                def clean(a, m):
+                    a = a[m] if a.size == m.size else a  # vcal may be empty when uncalibrated
+                    return a[np.isfinite(a)]
+
+                props = {
+                    "mass":      clean(mass, bm_mask),
+                    "density":   clean(dens, ifxm_mask),
+                    "vol_cal":   clean(vcal, ifxm_mask),
+                    "vol_uncal": clean(vun, ifxm_mask),
+                }
+            recs.append({"sample": sample, "props": props, "meta": meta_bag})
     return recs
+
+
+def load_ifxm(compiled_dir, baseline_density=_REQUIRED, *, sample_col="sample_name",
+              sheet_col="sheet_name", bm_lower_col="bm_gate_lower", bm_upper_col="bm_gate_upper",
+              ifxm_lower_col="ifxm_gate_lower", ifxm_upper_col="ifxm_gate_upper",
+              normalizers=VALUE_NORMALIZERS) -> list:
+    """Load paired iFXM data from a '*_compiled/' dir's experiment_data.xlsx (compile_experiment.py).
+
+    baseline_density (REQUIRED): fluid baseline added to the measured RELATIVE buoyant density to
+    get absolute density (g/mL). Not stored in the data — supply it explicitly.
+
+    Reads the 'metadata' sheet, then each sample's PAIRED ('pair_') block from the worksheet named
+    by `sheet_col`. Samples with no paired block are skipped; samples without pair_volume_fL simply
+    have an empty `vol_cal`. Mass is gated by the bm gate; density / vol_cal / vol_uncal share one
+    mask on the uncalibrated volume. Every metadata column is carried into each record's `meta`.
+    """
+    return _load_ifxm_records(
+        compiled_dir, baseline_density, sample_col, sheet_col,
+        (bm_lower_col, bm_upper_col, ifxm_lower_col, ifxm_upper_col), normalizers, paired=False)
+
+
+def load_ifxm_paired(compiled_dir, baseline_density=_REQUIRED, *, sample_col="sample_name",
+                     sheet_col="sheet_name", bm_lower_col="bm_gate_lower",
+                     bm_upper_col="bm_gate_upper", ifxm_lower_col="ifxm_gate_lower",
+                     ifxm_upper_col="ifxm_gate_upper", normalizers=VALUE_NORMALIZERS) -> list:
+    """Like load_ifxm, but keeps per-cell arrays row-ALIGNED across properties (one shared mask),
+    so a cell's mass / density / volume stay paired. Use for scatter_by / scatter_2d. Samples that
+    were not calibrated get an empty `vol_cal` (scatters using it are skipped, not misaligned)."""
+    return _load_ifxm_records(
+        compiled_dir, baseline_density, sample_col, sheet_col,
+        (bm_lower_col, bm_upper_col, ifxm_lower_col, ifxm_upper_col), normalizers, paired=True)
+
+
+# ---------------------------------------------------------------------------
+# Role inference — classify each metadata column so plots can be chosen intelligently
+# ---------------------------------------------------------------------------
+DEFAULT_STRUCTURAL = {"sheet_name", "hdf5_key", "coulter_column", "calibration_factor"}
+STRUCTURAL_PATTERNS = [re.compile(p) for p in (r"^has_", r"_gate_lower$", r"_gate_upper$",
+                                               r"^bm_gate", r"^ifxm_gate")]
+IDENTITY_COLS = {"sample_name"}
+
+_TIME_NAME = re.compile(r"(?i)(^|_)(t|time|elapsed)(_|$)")
+# suffix -> unit, longest first so '_hours' wins over '_h'
+_TIME_SUFFIX = [("_hours", "h"), ("_hour", "h"), ("_hrs", "h"), ("_hr", "h"), ("_h", "h"),
+                ("_minutes", "min"), ("_mins", "min"), ("_min", "min"),
+                ("_seconds", "s"), ("_sec", "s")]
+_UNIT_PER_HOUR = {"h": 1.0, "min": 60.0, "s": 3600.0}
+_GRADIENT_HINTS = re.compile(
+    r"(?i)(dose|conc|concentration|passage|day|cycle|generation|gen|temp|ph|dilution)")
+
+_BOOL_SETS = [{"yes", "no"}, {"true", "false"}, {"0", "1"}, {"y", "n"}, {"t", "f"}]
+_TRUTHY = {"yes", "true", "1", "y", "t"}
+_ORDERED_MAX_CARD = 15   # numeric non-time non-hint below this is proposed as an ordered gradient
+
+
+def _is_structural(col: str) -> bool:
+    return col in DEFAULT_STRUCTURAL or any(p.search(col) for p in STRUCTURAL_PATTERNS)
+
+
+def _time_unit(col: str):
+    """(unit, confirm) for a time column name, or (None, None) if the name is not time-like.
+    confirm=True when the unit had to be assumed (generic 'time'/'t' with no unit suffix)."""
+    c = col.lower()
+    for suf, u in _TIME_SUFFIX:
+        if c.endswith(suf):
+            return u, False
+    if _TIME_NAME.search(col):
+        return "h", True   # generic time name, assume hours but flag for confirmation
+    return None, None
+
+
+def _role(col, role, values, order, **kw):
+    info = {"col": col, "role": role, "values": list(values), "order": list(order),
+            "unit": None, "to_hours": None, "cardinality": len(set(values)),
+            "use_for": set(), "reason": "", "confirm": False}
+    info.update(kw)
+    return info
+
+
+def classify_column(col, values) -> dict:
+    """Classify a single column from its NAME and its non-blank VALUES into a RoleInfo dict.
+    Pure and dtype-agnostic (numeric-ness is inferred by float-coercion), so it works from either a
+    metadata DataFrame column or the values in loaded records."""
+    vals = [v for v in values if not _is_blank(v)]
+    uniq = list(dict.fromkeys(vals))                 # unique, order-preserving
+    low = {str(v).strip().lower() for v in uniq}
+    nums = _to_floats(uniq)
+
+    if _is_structural(col):
+        return _role(col, "structural", uniq, uniq, reason="pipeline/structural column — ignored")
+    if col in IDENTITY_COLS:
+        return _role(col, "label", uniq, uniq, use_for={"label"}, reason="sample identity")
+
+    # boolean (checkbox columns are literally 'yes'/'no')
+    if low and any(low <= s for s in _BOOL_SETS) and len(low) <= 2:
+        order = sorted(uniq, key=lambda v: str(v).strip().lower() in _TRUTHY)  # falsey -> truthy
+        return _role(col, "boolean", uniq, order,
+                     use_for={"group", "compare", "facet", "color", "series"},
+                     reason=f"boolean ({'/'.join(map(str, order))})")
+
+    # time
+    unit, confirm = _time_unit(col)
+    if nums is not None and unit is not None:
+        per_h = _UNIT_PER_HOUR[unit]
+        order = sorted(uniq, key=lambda v: float(v))
+        return _role(col, "time", uniq, order, unit=unit, to_hours=(lambda v, k=per_h: float(v) / k),
+                     use_for={"order", "series", "color"}, confirm=confirm,
+                     reason=f"time in {unit}" + (" (unit assumed — confirm)" if confirm else ""))
+
+    # ordered / gradient (numeric, non-time)
+    if nums is not None:
+        hinted = bool(_GRADIENT_HINTS.search(col))
+        if hinted or len(uniq) <= _ORDERED_MAX_CARD:
+            order = sorted(uniq, key=lambda v: float(v))
+            why = "named like a gradient" if hinted else f"{len(uniq)} distinct numeric values"
+            return _role(col, "ordered", uniq, order,
+                         use_for={"order", "group", "compare", "color", "series"}, confirm=True,
+                         reason=f"numeric gradient? ({why}) — confirm ordered vs categorical")
+        return _role(col, "continuous", uniq, sorted(uniq, key=lambda v: float(v)),
+                     use_for={"color"}, reason="continuous numeric — color/scatter axis only")
+
+    # categorical (any cardinality; no cap)
+    order = sorted(uniq, key=lambda v: (-vals.count(v), str(v)))   # frequency desc, then alpha
+    note = "" if len(uniq) < len(vals) else " (one value per sample)"
+    return _role(col, "categorical", uniq, order,
+                 use_for={"group", "compare", "facet", "color", "series"},
+                 reason=f"categorical, {len(uniq)} values{note}")
+
+
+def infer_roles(records, *, overrides=None, skip=("rep",)) -> dict:
+    """Classify every metadata column present across `records` into a RoleInfo. `overrides` is a
+    {col: role_name} map that pins a column's role (e.g. force a numeric column to 'ordered' or
+    'categorical' after the user confirms the plan). `skip` omits synthesized columns from the
+    report (rep is always available for ordering/labels regardless)."""
+    cols = []
+    for r in records:
+        for c in r.get("meta", {}):
+            if c not in cols:
+                cols.append(c)
+    roles = {}
+    for col in cols:
+        if col in skip:
+            continue
+        info = classify_column(col, [rget(r, col) for r in records])
+        ov = (overrides or {}).get(col)
+        if ov and ov != info["role"]:
+            info = classify_column(col, [rget(r, col) for r in records])  # recompute base
+            info["role"] = ov
+            info["confirm"] = False
+            info["reason"] = f"role overridden to {ov}"
+            info["use_for"] = {
+                "boolean": {"group", "compare", "facet", "color", "series"},
+                "categorical": {"group", "compare", "facet", "color", "series"},
+                "ordered": {"order", "group", "compare", "color", "series"},
+                "time": {"order", "series", "color"},
+                "continuous": {"color"},
+                "label": {"label"}, "structural": set(),
+            }.get(ov, info["use_for"])
+        roles[col] = info
+    return roles
+
+
+def _role_for(records, col, roles):
+    """RoleInfo for `col`: from `roles` if given, else inferred on the fly from record values."""
+    if roles and col in roles:
+        return roles[col]
+    return classify_column(col, [rget(r, col) for r in records])
+
+
+# ---------------------------------------------------------------------------
+# Ordering + labels
+# ---------------------------------------------------------------------------
+def group_order(records, col, roles=None) -> list:
+    """Values of `col` present in `records`, in canonical plotting order (role-defined)."""
+    role = _role_for(records, col, roles)
+    present = list(dict.fromkeys(rget(r, col) for r in records if rget(r, col) is not None))
+    ordered = [v for v in role["order"] if v in present]
+    ordered += [v for v in present if v not in ordered]
+    return ordered
+
+
+def _sort_key(r, col, role):
+    v = rget(r, col)
+    if role["role"] in ("time", "ordered", "continuous"):
+        try:
+            return (0, float(v))
+        except (TypeError, ValueError):
+            return (1, 0.0)
+    order = role["order"]
+    return (order.index(v), 0.0) if v in order else (len(order), 0.0)
+
+
+def sort_records(records, by, roles=None) -> list:
+    """Sort records by a list of (col, ...) — each col ordered per its role (time/ordered numeric,
+    else canonical categorical order). `by` may be a list of column names or (col, _) pairs."""
+    cols = [b[0] if isinstance(b, (tuple, list)) else b for b in by]
+    role_map = {c: _role_for(records, c, roles) for c in cols}
+
+    def key(r):
+        return tuple(_sort_key(r, c, role_map[c]) for c in cols)
+    return sorted(records, key=key)
+
+
+def _time_label(t) -> str:
+    try:
+        t = float(t)
+    except (TypeError, ValueError):
+        return str(t)
+    return f"{int(t)}h" if t == int(t) else f"{t}h"
+
+
+def value_label(col, value, roles=None, records=None) -> str:
+    """Short label for a single value of `col`, role-aware (time -> '6h', boolean -> 'is_x=yes')."""
+    role = roles.get(col) if roles and col in roles else (
+        _role_for(records, col, None) if records is not None else {"role": "categorical", "unit": None})
+    if role["role"] == "time":
+        conv = role.get("to_hours")
+        return _time_label(conv(value) if conv else value)
+    if role["role"] == "boolean":
+        return f"{col}={value}"
+    return str(value)
+
+
+def _detail_label(r, roles, time_col) -> str:
+    """Per-sample row/box label inside a single group: time (if any) + rep, else the sample name."""
+    parts = []
+    if time_col is not None and rget(r, time_col) is not None:
+        parts.append(value_label(time_col, rget(r, time_col), roles))
+    parts.append(rget(r, "rep"))
+    return " ".join(p for p in parts if p) or r["sample"]
+
+
+def _compare_label(r, group_col, roles, time_col) -> str:
+    """Per-sample label in a cross-group comparison: group value + time + rep."""
+    parts = [str(rget(r, group_col))]
+    if time_col is not None and rget(r, time_col) is not None:
+        parts.append(value_label(time_col, rget(r, time_col), roles))
+    parts.append(rget(r, "rep"))
+    return " ".join(p for p in parts if p)
+
+
+# ---------------------------------------------------------------------------
+# Low-level primitives (operate on a passed-in ax; no semantics)
+# ---------------------------------------------------------------------------
+def _run_separators(ax, keys, label_fn=None) -> None:
+    """Bold labels under the axis with dark vertical separators between runs of equal `keys`."""
+    trans = blended_transform_factory(ax.transData, ax.transAxes)
+    n = len(keys)
+    prev, start = object(), 0
+    for i, k in enumerate(list(keys) + [object()]):
+        if i == n or k != prev:
+            if i > 0 and start < n:
+                mid = (start + i - 1) / 2
+                lab = label_fn(prev) if label_fn else str(prev)
+                ax.text(mid, -0.30, lab, ha="center", va="top", transform=trans,
+                        fontsize=9, fontweight="bold")
+                if i < n:
+                    ax.axvline(i - 0.5, color="black", lw=1.2, alpha=0.8, zorder=1)
+            start, prev = i, k
+
+
+def draw_ridge(ax, arrays, labels, colors, xlabel, overlap: float = 1.7) -> None:
+    """Ridge plot of per-row histograms (shared bins, max-normalized), stacked top-down."""
+    lo = min(v.min() for v in arrays)
+    hi = max(v.max() for v in arrays)
+    bins = np.linspace(lo, hi, 41)
+    n = len(arrays)
+    for i, (vals, c) in enumerate(zip(arrays, colors)):
+        counts, _ = np.histogram(vals, bins=bins, density=True)
+        h = counts / counts.max() * overlap if counts.max() > 0 else counts
+        stair = np.concatenate([h, h[-1:]])
+        base = n - 1 - i
+        ax.fill_between(bins, base, base + stair, step="post", color=c, alpha=0.6, zorder=n - i)
+        ax.step(bins, base + stair, where="post", color="black", lw=0.8, zorder=n - i)
+    ax.set_yticks([n - 1 - i for i in range(n)])
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel(xlabel)
+
+
+def draw_boxes(ax, arrays, labels, colors, ylabel, sep_keys=None, sep_label_fn=None) -> None:
+    """Boxplot + jittered datapoints, one box per array. Optional run separators under the axis."""
+    n = len(arrays)
+    for i, (vals, c) in enumerate(zip(arrays, colors)):
+        jitter = np.random.uniform(-0.18, 0.18, len(vals))
+        ax.scatter(np.full(len(vals), i, float) + jitter, vals,
+                   color=c, alpha=0.1, s=4, zorder=2, linewidths=0)
+        ax.boxplot(vals, positions=[i], widths=0.5, patch_artist=True, showfliers=False,
+                   boxprops=dict(facecolor=c, alpha=0.5),
+                   medianprops=dict(color="black", linewidth=1.5),
+                   whiskerprops=dict(color=c), capprops=dict(color=c))
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(labels, fontsize=7, rotation=45, ha="right")
+    if sep_keys is not None:
+        _run_separators(ax, sep_keys, sep_label_fn)
+    ax.set_xlim(-0.5, n - 0.5)
+    ax.set_ylabel(ylabel)
+
+
+def draw_ecdf(ax, arrays, labels, colors, xlabel) -> None:
+    """Overlaid empirical CDFs, one line per array."""
+    for vals, c, lab in zip(arrays, colors, labels):
+        x = np.sort(np.asarray(vals, float))
+        if x.size == 0:
+            continue
+        y = np.arange(1, x.size + 1) / x.size
+        ax.plot(x, y, color=c, lw=1.6, label=str(lab))
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Cumulative fraction")
+    ax.legend(frameon=False, fontsize=8)
+
+
+def draw_timecourse(ax, series: dict, colors: dict, xlabel, ylabel) -> None:
+    """Per-replicate means as points + per-x average as a line, one series per key.
+    `series`: {key: [(x, y), ...]}."""
+    for sval, pts in sorted(series.items(), key=lambda kv: str(kv[0])):
+        c = colors.get(sval, FALLBACK_COLOR)
+        t = np.array([p[0] for p in pts], float)
+        y = np.array([p[1] for p in pts], float)
+        ax.scatter(t, y, color=c, s=30, alpha=0.7, zorder=3)
+        uniq = sorted(set(t))
+        avg = [y[t == u].mean() for u in uniq]
+        ax.plot(uniq, avg, color=c, lw=1.5, marker="o", ms=6, zorder=2, label=str(sval))
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.legend(frameon=False, fontsize=8)
+
+
+def draw_scatter_marginal(fig, subplot_spec, x, y, color, xlabel, ylabel, title) -> None:
+    """A per-cell scatter with marginal histograms (x on top, y on right), inside subplot_spec."""
+    inner = gridspec.GridSpecFromSubplotSpec(
+        2, 2, subplot_spec=subplot_spec, width_ratios=[3, 1], height_ratios=[1, 3],
+        hspace=0.03, wspace=0.03)
+    ax_sc = fig.add_subplot(inner[1, 0])
+    ax_xh = fig.add_subplot(inner[0, 0], sharex=ax_sc)
+    ax_yh = fig.add_subplot(inner[1, 1], sharey=ax_sc)
+    fig.add_subplot(inner[0, 1]).axis("off")
+
+    ax_sc.scatter(x, y, color=color, s=2, alpha=0.3, linewidths=0)
+    ax_xh.hist(x, bins=30, color=color, alpha=0.7)
+    ax_yh.hist(y, bins=30, orientation="horizontal", color=color, alpha=0.7)
+
+    plt.setp(ax_xh.get_xticklabels(), visible=False)
+    plt.setp(ax_yh.get_yticklabels(), visible=False)
+    ax_xh.tick_params(bottom=False, labelsize=6)
+    ax_yh.tick_params(left=False, labelsize=6)
+    ax_xh.set_title(title, fontsize=8)
+    ax_sc.set_xlabel(xlabel, fontsize=7)
+    ax_sc.set_ylabel(ylabel, fontsize=7)
+    ax_sc.tick_params(labelsize=6)
+
+
+# Backward-compatible private aliases (older code referenced the underscore names).
+_ridge, _boxes = draw_ridge, draw_boxes
 
 
 # ---------------------------------------------------------------------------
 # Small utilities
 # ---------------------------------------------------------------------------
-def _time_label(t: float) -> str:
-    return f"{int(t)}h" if float(t) == int(t) else f"{t}h"
+def _slug(value) -> str:
+    return re.sub(r"[^0-9a-zA-Z]+", "-", str(value).strip().lower()).strip("-") or "na"
 
 
 def _save(fig, name: str, out_dir) -> None:
@@ -404,213 +751,150 @@ def _with_prop(records: list, prop: str) -> list:
     return [r for r in records if len(r["props"].get(prop, [])) > 0]
 
 
-# ---------------------------------------------------------------------------
-# Plot primitives (operate on a passed-in ax)
-# ---------------------------------------------------------------------------
-def _timepoint_separators(ax, times: list, n: int) -> None:
-    """Bold per-timepoint labels under the axis with dark vertical separators."""
-    trans = blended_transform_factory(ax.transData, ax.transAxes)
-    prev, start = None, 0
-    for i, t in enumerate(list(times) + [None]):
-        if t != prev:
-            if prev is not None:
-                mid = (start + i - 1) / 2
-                ax.text(mid, -0.30, _time_label(prev), ha="center", va="top",
-                        transform=trans, fontsize=9, fontweight="bold")
-                if i < n:
-                    ax.axvline(i - 0.5, color="black", lw=1.2, alpha=0.8, zorder=1)
-            start, prev = i, t
-
-
-def _ridge(ax, arrays: list, labels: list, colors: list, xlabel: str,
-           overlap: float = 1.7) -> None:
-    """Ridge plot of per-row histograms (shared bins, max-normalized), stacked top-down."""
-    lo = min(v.min() for v in arrays)
-    hi = max(v.max() for v in arrays)
-    bins = np.linspace(lo, hi, 41)
-    n = len(arrays)
-    for i, (vals, c) in enumerate(zip(arrays, colors)):
-        counts, _ = np.histogram(vals, bins=bins, density=True)
-        h = counts / counts.max() * overlap if counts.max() > 0 else counts
-        stair = np.concatenate([h, h[-1:]])
-        base = n - 1 - i
-        ax.fill_between(bins, base, base + stair, step="post", color=c,
-                        alpha=0.6, zorder=n - i)
-        ax.step(bins, base + stair, where="post", color="black", lw=0.8, zorder=n - i)
-    ax.set_yticks([n - 1 - i for i in range(n)])
-    ax.set_yticklabels(labels, fontsize=7)
-    ax.set_xlabel(xlabel)
-
-
-def _boxes(ax, arrays: list, labels: list, colors: list, ylabel: str,
-           times: list = None) -> None:
-    """Boxplot + jittered datapoints, one box per array."""
-    n = len(arrays)
-    for i, (vals, c) in enumerate(zip(arrays, colors)):
-        jitter = np.random.uniform(-0.18, 0.18, len(vals))
-        ax.scatter(np.full(len(vals), i, float) + jitter, vals,
-                   color=c, alpha=0.1, s=4, zorder=2, linewidths=0)
-        ax.boxplot(vals, positions=[i], widths=0.5, patch_artist=True, showfliers=False,
-                   boxprops=dict(facecolor=c, alpha=0.5),
-                   medianprops=dict(color="black", linewidth=1.5),
-                   whiskerprops=dict(color=c), capprops=dict(color=c))
-    ax.set_xticks(range(n))
-    ax.set_xticklabels(labels, fontsize=7, rotation=45, ha="right")
-    if times is not None:
-        _timepoint_separators(ax, times, n)
-    ax.set_xlim(-0.5, n - 0.5)
-    ax.set_ylabel(ylabel)
-
-
-def _timecourse(ax, records: list, prop: str, color_map: dict, key: str,
-                ylabel: str) -> None:
-    """Per-replicate means as points + per-timepoint average as a line, one series/key."""
-    series = {}
-    for r in records:
-        arr = r["props"].get(prop)
-        if arr is None or len(arr) == 0:
-            continue
-        series.setdefault(r[key], []).append((r["time_h"], arr.mean()))
-
-    for sval, pts in sorted(series.items()):
-        c = color_map.get(sval, FALLBACK_COLOR)
-        t = np.array([p[0] for p in pts])
-        y = np.array([p[1] for p in pts])
-        ax.scatter(t, y, color=c, s=30, alpha=0.7, zorder=3)
-        uniq = sorted(set(t))
-        avg = [y[t == u].mean() for u in uniq]
-        ax.plot(uniq, avg, color=c, lw=1.5, marker="o", ms=6, zorder=2, label=str(sval))
-    ax.set_xlabel("Time (h)")
-    ax.set_ylabel(ylabel)
-    ax.legend(frameon=False, fontsize=8)
+def _find_time_col(records, roles):
+    """The first column whose role is 'time', if any (used to order samples within groups)."""
+    roles = roles or infer_roles(records)
+    for col, info in roles.items():
+        if info["role"] == "time":
+            return col
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Label helpers
+# Mid-level combinators (parameterized by WHICH column to group / compare / order by)
 # ---------------------------------------------------------------------------
-def _full_label(r: dict) -> str:
-    """Time + drug (if any) + rep — so every row shows both timepoint and drug."""
-    parts = [_time_label(r["time_h"])]
-    if r["drug"]:
-        parts.append(r["drug"])
-    parts.append(r["rep"])
-    return " ".join(parts)
-
-
-def _box_tick(r: dict) -> str:
-    """Drug (if any) + rep; the timepoint is carried by the separators."""
-    return f"{r['drug']} {r['rep']}" if r["drug"] else r["rep"]
-
-
-def _ridge_label(r: dict) -> str:
-    # starved samples share time 0, so show full names to tell them apart
-    return r["sample"] if r["cond"] == "starved" else _full_label(r)
-
-
-def _box_label(r: dict) -> str:
-    return r["sample"] if r["cond"] == "starved" else _box_tick(r)
-
-
-# ---------------------------------------------------------------------------
-# Plot drivers (create the figure, delegate to a primitive, title, save)
-# ---------------------------------------------------------------------------
-def ridge_box_by_condition(records, prop, ylabel, datatype, fig_dir,
-                           cond_colors=None) -> None:
-    """One ridge figure and one box figure per condition."""
+def plot_grouped(records, prop, ylabel, datatype, fig_dir, *, group_col, roles=None,
+                 kinds=("ridge", "box"), time_col=None, colors=None) -> None:
+    """DETAIL within each group: one figure per value of `group_col`; each ridge row / box is a
+    sample in that group, ordered by time (if a time column exists) then rep.
+    Files: {datatype}_{prop}_{kind}_{group_col}={slug(value)}.png"""
     recs = _with_prop(records, prop)
-    cond_colors = cond_colors or build_color_map(sorted(set(r["cond"] for r in recs)), COND_COLORS)
-    for cond in sorted(set(r["cond"] for r in recs)):
-        sub = sorted([r for r in recs if r["cond"] == cond],
-                     key=lambda r: (r["time_h"], r["rep"]))
+    if not recs:
+        return
+    roles = roles or infer_roles(records)
+    time_col = time_col if time_col is not None else _find_time_col(records, roles)
+    colors = colors or color_map_for(records, group_col, roles)
+    for v in group_order(recs, group_col, roles):
+        sub = [r for r in recs if rget(r, group_col) == v]
+        order_by = [c for c in (time_col, "rep") if c]
+        sub = sort_records(sub, order_by, roles) if order_by else sub
         if not sub:
             continue
         arrays = [r["props"][prop] for r in sub]
-        colors = [cond_colors.get(cond, FALLBACK_COLOR)] * len(sub)
-        times  = [r["time_h"] for r in sub]
+        col = colors.get(v, FALLBACK_COLOR)
+        labels = [_detail_label(r, roles, time_col) for r in sub]
+        title = f"{datatype} {prop} — {value_label(group_col, v, roles)}"
+        tag = f"{group_col}={_slug(v)}"
+        if "ridge" in kinds:
+            fig, ax = plt.subplots(figsize=(8, max(3, len(sub) * 0.55)))
+            draw_ridge(ax, arrays, labels, [col] * len(sub), ylabel)
+            ax.set_title(title)
+            _save(fig, f"{datatype}_{prop}_ridge_{tag}.png", fig_dir)
+        if "box" in kinds:
+            times = [rget(r, time_col) for r in sub] if time_col else None
+            fig, ax = plt.subplots(figsize=(max(5, len(sub) * 0.9), 5))
+            draw_boxes(ax, arrays, labels, [col] * len(sub), ylabel,
+                       sep_keys=times, sep_label_fn=_time_label if times else None)
+            ax.set_title(title)
+            _save(fig, f"{datatype}_{prop}_box_{tag}.png", fig_dir)
 
-        fig, ax = plt.subplots(figsize=(8, max(3, len(sub) * 0.55)))
-        _ridge(ax, arrays, [_ridge_label(r) for r in sub], colors, ylabel)
-        ax.set_title(f"{datatype} {prop} — {cond}")
-        _save(fig, f"{datatype}_{prop}_ridge_{cond}.png", fig_dir)
 
-        fig, ax = plt.subplots(figsize=(max(5, len(sub) * 0.9), 5))
-        _boxes(ax, arrays, [_box_label(r) for r in sub], colors, ylabel, times=times)
-        ax.set_title(f"{datatype} {prop} — {cond}")
-        _save(fig, f"{datatype}_{prop}_box_{cond}.png", fig_dir)
-
-
-def timecourse(records, prop, ylabel, datatype, fig_dir, cond_colors=None) -> None:
-    """One timecourse figure combining all conditions (series colored by condition)."""
+def compare_groups(records, prop, ylabel, datatype, fig_dir, *, group_col, roles=None,
+                   kinds=("box", "ridge"), agg="per_sample", colors=None, time_col=None) -> None:
+    """COMPARISON across the values of `group_col`. agg='per_sample' (default) draws one box/ridge
+    row per sample, colored by its group value and separated by group; agg='pool' pools all cells
+    per group value into a single box/ridge row. Both a box and a ridge are produced by default.
+    Files: {datatype}_{prop}_{kind}_by_{group_col}.png"""
     recs = _with_prop(records, prop)
     if not recs:
         return
-    cond_colors = cond_colors or build_color_map(sorted(set(r["cond"] for r in recs)), COND_COLORS)
-    fig, ax = plt.subplots(figsize=(8, 5))
-    _timecourse(ax, recs, prop, cond_colors, "cond", ylabel)
-    ax.set_title(f"{datatype} {prop} — timecourse")
-    _save(fig, f"{datatype}_{prop}_timecourse.png", fig_dir)
+    roles = roles or infer_roles(records)
+    time_col = time_col if time_col is not None else _find_time_col(records, roles)
+    colors = colors or color_map_for(records, group_col, roles)
+    values = group_order(recs, group_col, roles)
+    if len(values) < 1:
+        return
+
+    if agg == "pool":
+        arrays, labels, cols = [], [], []
+        for v in values:
+            pooled = np.concatenate([r["props"][prop] for r in recs if rget(r, group_col) == v])
+            if len(pooled) == 0:
+                continue
+            arrays.append(pooled)
+            labels.append(value_label(group_col, v, roles))
+            cols.append(colors.get(v, FALLBACK_COLOR))
+        sep_keys = None
+        handles = None
+    else:  # per_sample
+        sub = sort_records(recs, [c for c in (group_col, time_col, "rep") if c], roles)
+        arrays = [r["props"][prop] for r in sub]
+        labels = [_compare_label(r, group_col, roles, time_col) for r in sub]
+        cols = [colors.get(rget(r, group_col), FALLBACK_COLOR) for r in sub]
+        sep_keys = [rget(r, group_col) for r in sub]
+        handles = [Patch(facecolor=colors.get(v, FALLBACK_COLOR),
+                         label=value_label(group_col, v, roles)) for v in values]
+    if not arrays:
+        return
+
+    title = f"{datatype} {prop} — by {group_col}"
+    if "box" in kinds:
+        fig, ax = plt.subplots(figsize=(max(5, len(arrays) * 0.9), 5))
+        draw_boxes(ax, arrays, labels, cols, ylabel,
+                   sep_keys=sep_keys, sep_label_fn=(lambda v: str(v)) if sep_keys else None)
+        if handles:
+            ax.legend(handles=handles, frameon=False, fontsize=8)
+        ax.set_title(title)
+        _save(fig, f"{datatype}_{prop}_box_by_{group_col}.png", fig_dir)
+    if "ridge" in kinds:
+        fig, ax = plt.subplots(figsize=(9, max(3, len(arrays) * 0.55)))
+        draw_ridge(ax, arrays, labels, cols, ylabel)
+        if handles:
+            ax.legend(handles=handles, frameon=False, fontsize=8)
+        ax.set_title(title)
+        _save(fig, f"{datatype}_{prop}_ridge_by_{group_col}.png", fig_dir)
 
 
-def drug_split(records, prop, ylabel, datatype, fig_dir, drug_colors=None) -> None:
-    """Ridge / box / timecourse for the drug-treated arm, split & colored by drug_name.
-    No-op when there are no drug-treated records (e.g. a wt experiment without a drug arm)."""
-    # Trigger on any record carrying a drug annotation, regardless of the condition label —
-    # so this works whether the drug arm is called "drug_treated" or something experiment-specific.
-    recs = [r for r in _with_prop(records, prop) if r["drug"]]
+def timecourse_by(records, prop, ylabel, datatype, fig_dir, *, time_col=None, roles=None,
+                  series_col=None, colors=None) -> None:
+    """Timecourse of per-sample means vs a unit-aware time axis, colored by `series_col`.
+    Files: {datatype}_{prop}_timecourse[_{series_col}].png"""
+    recs = _with_prop(records, prop)
     if not recs:
         return
-    drug_colors = drug_colors or build_color_map(
-        sorted(set(r["drug"] for r in recs)), DRUG_COLORS)
-    sub = sorted(recs, key=lambda r: (r["drug"], r["time_h"], r["rep"]))
-    arrays = [r["props"][prop] for r in sub]
-    colors = [drug_colors.get(r["drug"], FALLBACK_COLOR) for r in sub]
-    labels = [_full_label(r) for r in sub]  # time + drug + rep
-    handles = [Patch(facecolor=drug_colors[d], label=d)
-               for d in drug_colors if any(r["drug"] == d for r in sub)]
+    roles = roles or infer_roles(records)
+    time_col = time_col if time_col is not None else _find_time_col(records, roles)
+    if time_col is None:
+        return
+    trole = _role_for(records, time_col, roles)
+    conv = trole.get("to_hours") or (lambda v: float(v))
+    colors = colors or (color_map_for(records, series_col, roles) if series_col else {})
 
-    fig, ax = plt.subplots(figsize=(9, max(3, len(sub) * 0.55)))
-    _ridge(ax, arrays, labels, colors, ylabel)
-    ax.legend(handles=handles, frameon=False, fontsize=8)
-    ax.set_title(f"{datatype} {prop} — drug treated")
-    _save(fig, f"{datatype}_{prop}_drug_ridge.png", fig_dir)
-
-    fig, ax = plt.subplots(figsize=(max(5, len(sub) * 0.9), 5))
-    _boxes(ax, arrays, labels, colors, ylabel)
-    ax.legend(handles=handles, frameon=False, fontsize=8)
-    ax.set_title(f"{datatype} {prop} — drug treated")
-    _save(fig, f"{datatype}_{prop}_drug_box.png", fig_dir)
+    series = {}
+    for r in recs:
+        try:
+            x = conv(rget(r, time_col))
+        except (TypeError, ValueError):
+            continue
+        key = rget(r, series_col) if series_col else "all"
+        series.setdefault(key, []).append((x, r["props"][prop].mean()))
 
     fig, ax = plt.subplots(figsize=(8, 5))
-    _timecourse(ax, recs, prop, drug_colors, "drug", ylabel)
-    ax.set_title(f"{datatype} {prop} — drug timecourse")
-    _save(fig, f"{datatype}_{prop}_drug_timecourse.png", fig_dir)
+    draw_timecourse(ax, series, colors, "Time (h)", ylabel)
+    suffix = f"_{series_col}" if series_col else ""
+    ax.set_title(f"{datatype} {prop} — timecourse" + (f" by {series_col}" if series_col else ""))
+    _save(fig, f"{datatype}_{prop}_timecourse{suffix}.png", fig_dir)
 
 
-# ---------------------------------------------------------------------------
-# 2-D property-vs-property scatter with marginal histograms (per-cell)
-# ---------------------------------------------------------------------------
-def scatter_2d(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir,
-               cond_colors=None, drug_colors=None, trim_x=None, trim_y=None,
-               ncols=4) -> None:
-    """Per-cell scatter of prop_y vs prop_x with marginal histograms — one figure per condition,
-    laid out as a grid of per-sample panels. Each panel is a main scatter with a histogram of
-    prop_x above it and a horizontal histogram of prop_y to its right (nested GridSpec with
-    3:1 / 1:3 ratios). Panels are colored by drug when present, else by condition, and titled per
-    sample. Styled to match density_mass_scatter in the reference analysis.
-
-    IMPORTANT: pass records from load_ifxm_paired (not load_ifxm) so prop_x and prop_y are
-    row-aligned per cell and equal length. Records where either property is empty or the two
-    lengths differ are skipped (with a warning) rather than mis-paired.
-
-    trim_x / trim_y ('mad' | '3sigma' | None): reject outliers on that axis, applied jointly so
-    the pair stays aligned. Use trim_y='mad' for density (heavy tails), mirroring the reference.
-
-    Files: {datatype}_{prop_y}_vs_{prop_x}_{cond}.png
-    """
-    cond_colors = cond_colors or build_color_map(
-        sorted(set(r["cond"] for r in records)), COND_COLORS)
-    drug_colors = drug_colors or build_color_map(
-        sorted(set(r["drug"] for r in records if r["drug"])), DRUG_COLORS)
+def scatter_by(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir, *, group_col=None,
+               color_col=None, roles=None, ncols=4) -> None:
+    """Per-cell scatter of prop_y vs prop_x with marginal histograms — a grid of per-sample panels.
+    One figure per value of `group_col` (or a single figure if group_col is None). Panels colored
+    by `color_col` (defaults to group_col). Pass records from load_ifxm_paired so x and y are
+    row-aligned. Files: {datatype}_{prop_y}_vs_{prop_x}[_{group_col}={slug(value)}].png"""
+    roles = roles or infer_roles(records)
+    color_col = color_col or group_col
+    colors = color_map_for(records, color_col, roles) if color_col else {}
 
     def _xy(r):
         x = np.asarray(r["props"].get(prop_x, []), float)
@@ -619,73 +903,222 @@ def scatter_2d(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir,
             return None
         if x.size != y.size:
             print(f"  WARNING: {r['sample']} {prop_x}/{prop_y} lengths differ "
-                  f"({x.size} vs {y.size}) — skipping (did you use load_ifxm_paired?)")
+                  f"({x.size} vs {y.size}) — skipping (use load_ifxm_paired?)")
             return None
-        keep = _trim_mask(x, trim_x) & _trim_mask(y, trim_y)
-        if keep.sum() == 0:
-            return None
-        return x[keep], y[keep]
+        keep = np.isfinite(x) & np.isfinite(y)
+        return (x[keep], y[keep]) if keep.sum() else None
 
     usable = [(r, xy) for r in records if (xy := _xy(r)) is not None]
     if not usable:
         return
+    time_col = _find_time_col(records, roles)
 
-    for cond in sorted(set(r["cond"] for r, _ in usable)):
-        sub = sorted([ru for ru in usable if ru[0]["cond"] == cond],
-                     key=lambda ru: (ru[0]["time_h"], ru[0]["drug"], ru[0]["rep"]))
+    if group_col is None:
+        groups = [(None, usable)]
+    else:
+        groups = [(v, [ru for ru in usable if rget(ru[0], group_col) == v])
+                  for v in group_order([r for r, _ in usable], group_col, roles)]
+
+    xy_by_sample = {r["sample"]: xy for r, xy in usable}
+    for gval, sub in groups:
         if not sub:
             continue
+        order_by = [c for c in (time_col, "rep") if c]
+        ordered_recs = sort_records([r for r, _ in sub], order_by, roles) if order_by \
+            else [r for r, _ in sub]
+        sub = [(r, xy_by_sample[r["sample"]]) for r in ordered_recs]
 
         n = len(sub)
         nc = min(n, ncols)
         nrows = int(np.ceil(n / nc))
         fig = plt.figure(figsize=(nc * 3.5, nrows * 3.5))
         outer = gridspec.GridSpec(nrows, nc, figure=fig, hspace=0.55, wspace=0.45)
-
         for idx, (r, (x, y)) in enumerate(sub):
             ri, ci = divmod(idx, nc)
-            inner = gridspec.GridSpecFromSubplotSpec(
-                2, 2, subplot_spec=outer[ri, ci],
-                width_ratios=[3, 1], height_ratios=[1, 3],
-                hspace=0.03, wspace=0.03,
-            )
-            ax_sc = fig.add_subplot(inner[1, 0])
-            ax_xh = fig.add_subplot(inner[0, 0], sharex=ax_sc)
-            ax_yh = fig.add_subplot(inner[1, 1], sharey=ax_sc)
-            fig.add_subplot(inner[0, 1]).axis("off")
-
-            c = drug_colors.get(r["drug"], FALLBACK_COLOR) if r["drug"] \
-                else cond_colors.get(cond, FALLBACK_COLOR)
-
-            ax_sc.scatter(x, y, color=c, s=2, alpha=0.3, linewidths=0)
-            ax_xh.hist(x, bins=30, color=c, alpha=0.7)
-            ax_yh.hist(y, bins=30, orientation="horizontal", color=c, alpha=0.7)
-
-            plt.setp(ax_xh.get_xticklabels(), visible=False)
-            plt.setp(ax_yh.get_yticklabels(), visible=False)
-            ax_xh.tick_params(bottom=False)
-            ax_yh.tick_params(left=False)
-            ax_xh.set_title(_full_label(r), fontsize=8)
-            ax_sc.set_xlabel(xlabel, fontsize=7)
-            ax_sc.set_ylabel(ylabel, fontsize=7)
-            ax_sc.tick_params(labelsize=6)
-            ax_xh.tick_params(labelsize=6)
-            ax_yh.tick_params(labelsize=6)
-
+            c = colors.get(rget(r, color_col), FALLBACK_COLOR) if color_col else FALLBACK_COLOR
+            draw_scatter_marginal(fig, outer[ri, ci], x, y, c, xlabel, ylabel,
+                                  _detail_label(r, roles, time_col))
         for idx in range(n, nrows * nc):
             ri, ci = divmod(idx, nc)
             fig.add_subplot(outer[ri, ci]).axis("off")
+        gsuffix = f"_{group_col}={_slug(gval)}" if group_col is not None else ""
+        gtitle = f" — {value_label(group_col, gval, roles)}" if group_col is not None else ""
+        fig.suptitle(f"{datatype} {prop_y} vs {prop_x}{gtitle}", fontsize=11)
+        _save(fig, f"{datatype}_{prop_y}_vs_{prop_x}{gsuffix}.png", fig_dir)
 
-        fig.suptitle(f"{datatype} {prop_y} vs {prop_x} — {cond}", fontsize=11)
-        _save(fig, f"{datatype}_{prop_y}_vs_{prop_x}_{cond}.png", fig_dir)
+
+def facet(records, prop, ylabel, datatype, fig_dir, *, facet_col, roles=None, inner="box",
+          ncols=4, colors=None) -> None:
+    """Compact grid: one panel per value of `facet_col` in a SINGLE figure (each panel pools that
+    value's cells into one inner box/ridge). File: {datatype}_{prop}_facet_{facet_col}.png"""
+    recs = _with_prop(records, prop)
+    if not recs:
+        return
+    roles = roles or infer_roles(records)
+    colors = colors or color_map_for(records, facet_col, roles)
+    values = group_order(recs, facet_col, roles)
+    n = len(values)
+    if n == 0:
+        return
+    nc = min(n, ncols)
+    nrows = int(np.ceil(n / nc))
+    fig, axes = plt.subplots(nrows, nc, figsize=(nc * 3.2, nrows * 3.2), squeeze=False)
+    for idx, v in enumerate(values):
+        ax = axes[idx // nc][idx % nc]
+        arr = np.concatenate([r["props"][prop] for r in recs if rget(r, facet_col) == v])
+        c = colors.get(v, FALLBACK_COLOR)
+        if inner == "ridge":
+            draw_ridge(ax, [arr], [""], [c], ylabel)
+        else:
+            draw_boxes(ax, [arr], [""], [c], ylabel)
+        ax.set_title(value_label(facet_col, v, roles), fontsize=9)
+    for idx in range(n, nrows * nc):
+        axes[idx // nc][idx % nc].axis("off")
+    fig.suptitle(f"{datatype} {prop} — by {facet_col}", fontsize=11)
+    _save(fig, f"{datatype}_{prop}_facet_{facet_col}.png", fig_dir)
+
+
+def cross_groups(records, prop, ylabel, datatype, fig_dir, *, cols, roles=None,
+                 kinds=("box", "ridge"), colors=None) -> None:
+    """CROSSING on request: compare the cross-product of two (or more) columns. Adds a synthetic
+    joined key (e.g. 'activated | DMEM') and runs compare_groups on it, per_sample.
+    File: {datatype}_{prop}_{kind}_by_{colA}-x-{colB}.png"""
+    cross_col = "-x-".join(cols)
+    tagged = []
+    for r in records:
+        key = " | ".join(str(rget(r, c)) for c in cols)
+        rr = dict(r)
+        rr["meta"] = dict(r["meta"])
+        rr["meta"][cross_col] = key
+        tagged.append(rr)
+    compare_groups(tagged, prop, ylabel, datatype, fig_dir, group_col=cross_col, roles=roles,
+                   kinds=kinds, agg="per_sample", colors=colors)
+
+
+# ---------------------------------------------------------------------------
+# Deprecated wrappers (old hardcoded drivers, re-expressed over the combinators)
+# ---------------------------------------------------------------------------
+def ridge_box_by_condition(records, prop, ylabel, datatype, fig_dir, cond_colors=None) -> None:
+    """Deprecated: use plot_grouped(group_col='condition')."""
+    plot_grouped(records, prop, ylabel, datatype, fig_dir, group_col="condition", colors=cond_colors)
+
+
+def timecourse(records, prop, ylabel, datatype, fig_dir, cond_colors=None) -> None:
+    """Deprecated: use timecourse_by(series_col='condition')."""
+    timecourse_by(records, prop, ylabel, datatype, fig_dir, series_col="condition", colors=cond_colors)
+
+
+def drug_split(records, prop, ylabel, datatype, fig_dir, drug_colors=None) -> None:
+    """Deprecated: use compare_groups(group_col='drug_name') + timecourse_by(series_col='drug_name')."""
+    recs = [r for r in records if rget(r, "drug_name")]
+    if not recs:
+        return
+    compare_groups(recs, prop, ylabel, datatype, fig_dir, group_col="drug_name", colors=drug_colors)
+    timecourse_by(recs, prop, ylabel, datatype, fig_dir, series_col="drug_name", colors=drug_colors)
+
+
+def scatter_2d(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir, **kw) -> None:
+    """Deprecated: use scatter_by(group_col='condition')."""
+    scatter_by(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir, group_col="condition")
+
+
+# ---------------------------------------------------------------------------
+# High-level: infer a plot plan, show it, execute it
+# ---------------------------------------------------------------------------
+def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
+               include_ordered=True) -> dict:
+    """Infer a plot plan (list of PlotSpecs) from the column roles. For every boolean / categorical
+    (and, if include_ordered, approved ordered) column: a plot_grouped + a compare_groups per prop.
+    If a time column exists: a timecourse per prop, split by each grouping column. Scatters are
+    added for scatter_pairs. Returns {roles, props, plots:[{fn,prop,kwargs,rationale}]}."""
+    roles = roles or infer_roles(records)
+    props = props or [p for p in {k for r in records for k in r["props"]}]
+    time_col = _find_time_col(records, roles)
+
+    group_cols = [c for c, i in roles.items()
+                  if i["role"] in ("boolean", "categorical")
+                  or (include_ordered and i["role"] == "ordered")]
+
+    plots = []
+    for prop in props:
+        for gc in group_cols:
+            plots.append({"fn": "plot_grouped", "prop": prop, "kwargs": {"group_col": gc},
+                          "rationale": f"per-{gc} detail"})
+            plots.append({"fn": "compare_groups", "prop": prop, "kwargs": {"group_col": gc},
+                          "rationale": f"compare across {gc}"})
+        if time_col:
+            plots.append({"fn": "timecourse_by", "prop": prop,
+                          "kwargs": {"time_col": time_col, "series_col": None},
+                          "rationale": f"timecourse over {time_col}"})
+            for gc in group_cols:
+                plots.append({"fn": "timecourse_by", "prop": prop,
+                              "kwargs": {"time_col": time_col, "series_col": gc},
+                              "rationale": f"timecourse over {time_col}, split by {gc}"})
+    for (px, py, xl, yl) in (scatter_pairs or []):
+        gc = group_cols[0] if group_cols else None
+        plots.append({"fn": "scatter_by", "prop": f"{py}_vs_{px}",
+                      "kwargs": {"prop_x": px, "prop_y": py, "xlabel": xl, "ylabel": yl,
+                                 "group_col": gc},
+                      "rationale": "per-cell scatter" + (f" per {gc}" if gc else "")})
+    return {"roles": roles, "props": props, "plots": plots}
+
+
+def render_plan(plan) -> str:
+    """Human-readable summary of inferred roles + proposed plots, with any confirm-me flags —
+    the text to show the user for approval before generating/executing the driver."""
+    roles = plan["roles"]
+    lines = ["Inferred metadata roles:"]
+    for col, i in roles.items():
+        flag = "  [CONFIRM]" if i["confirm"] else ""
+        unit = f" [{i['unit']}]" if i.get("unit") else ""
+        lines.append(f"  - {col}: {i['role']}{unit} — {i['reason']}{flag}")
+    confirms = [c for c, i in roles.items() if i["confirm"]]
+    if confirms:
+        lines.append("")
+        lines.append("Needs your confirmation: " + ", ".join(confirms)
+                     + "  (pass overrides={col: 'ordered'|'categorical'|...} to pin)")
+    lines.append("")
+    lines.append(f"Proposed plots ({len(plan['plots'])}):")
+    for p in plan["plots"]:
+        lines.append(f"  - {p['fn']}({p['prop']}) — {p['rationale']}")
+    return "\n".join(lines)
+
+
+_COMBINATORS = None
+
+
+def autoplot(records, plan, datatype, fig_dir, prop_labels=None, paired_records=None) -> None:
+    """Execute a plan's PlotSpecs. Distribution/timecourse plots run on `records`; scatter_by specs
+    run on `paired_records` (row-aligned, from load_ifxm_paired) — pass it whenever the plan has
+    scatter pairs, or those specs are skipped. `prop_labels`: {prop: axis_label} for y-axis labels."""
+    global _COMBINATORS
+    if _COMBINATORS is None:
+        _COMBINATORS = {"plot_grouped": plot_grouped, "compare_groups": compare_groups,
+                        "timecourse_by": timecourse_by, "scatter_by": scatter_by,
+                        "facet": facet}
+    labels = prop_labels or {}
+    roles = plan["roles"]
+    warned = False
+    for spec in plan["plots"]:
+        fn = _COMBINATORS[spec["fn"]]
+        prop = spec["prop"]
+        kw = dict(spec["kwargs"], roles=roles)
+        if spec["fn"] == "scatter_by":
+            if paired_records is None:
+                if not warned:
+                    print("  (skipping scatter specs — pass paired_records=load_ifxm_paired(...))")
+                    warned = True
+                continue
+            fn(paired_records, datatype=datatype, fig_dir=fig_dir, **kw)
+        else:
+            fn(records, prop, labels.get(prop, prop), datatype, fig_dir, **kw)
 
 
 # ---------------------------------------------------------------------------
 # PowerPoint export
 # ---------------------------------------------------------------------------
 def save_pptx(fig_dir, out_path) -> None:
-    """Compile every PNG in fig_dir into a 16:9 deck, one image per slide (centered, aspect-fit).
-    Imported lazily so the toolkit is usable for plotting even without python-pptx installed."""
+    """Compile every PNG in fig_dir into a 16:9 deck, one image per slide (centered, aspect-fit)."""
     from PIL import Image as PILImage
     from pptx import Presentation
     from pptx.util import Inches, Emu

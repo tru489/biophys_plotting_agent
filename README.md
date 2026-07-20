@@ -28,7 +28,7 @@ as `/biophys-plotting:plot-experiment`, or just ask Claude to "plot my experimen
 directory.
 
 Python dependencies (for running generated drivers) are in [environment.yaml](environment.yaml)
-(`numpy pandas matplotlib pytables python-pptx pillow`):
+(`numpy pandas matplotlib openpyxl python-pptx pillow`):
 
 ```
 conda env create -f environment.yaml
@@ -39,13 +39,14 @@ Or reuse any existing analysis env that has those packages.
 
 ## Input data
 
-The skill plots **compiled + annotated** output of the `biophys_helpers` pipeline, one experiment
-per `<exp>_data/` directory:
+The skill plots the **raw output** of the `biophys_helpers` pipeline directly (no reorg step), one
+experiment at a time — whichever half exists:
 
 ```
-<exp>_data/
-├── coulter/{metadata.csv, data.h5}      # Coulter single-cell volumes + annotations
-└── ifxm/experiment_data.h5              # paired iFXM mass/volume/density + annotations
+<...>_compiled/experiment_data.xlsx                   # iFXM: paired mass/volume/density + annotations
+                                                      #   (from compile_experiment.py)
+<...>_coulter_sample_annotation/{metadata.csv, <input>.csv}  # Coulter: single-cell volumes + annotations
+                                                      #   (from annotate_coulter_samples.py)
 ```
 
 See [skills/plot-experiment/references/data_schema.md](skills/plot-experiment/references/data_schema.md)
@@ -64,6 +65,6 @@ biophys_plotting_agent/
 │   ├── SKILL.md                     # the workflow
 │   ├── biophys_plot_toolkit.py      # reusable plotting library
 │   ├── reference_driver.py          # driver template the skill adapts
-│   └── references/data_schema.md    # h5/metadata schema
+│   └── references/data_schema.md    # xlsx/csv/metadata schema
 └── environment.yaml                 # conda env for running generated drivers
 ```

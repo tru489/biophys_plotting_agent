@@ -4,100 +4,125 @@ description: >-
   Use when the user wants to plot compiled biophysics experiment data (FXM / SMR / Coulter —
   buoyant mass, density, cell volume) into the standard ridge / box / timecourse / scatter figure
   grid. Triggers on "plot my experiment", "make the ifxm/coulter figures", "generate the plots for
-  <exp>", or a directory containing `<exp>_data/ifxm/experiment_data.h5` or
-  `<exp>_data/coulter/metadata.csv`. Inspects the experiment's annotation schema (conditions,
+  <exp>", or a directory containing a `*_compiled/experiment_data.xlsx` (iFXM) or a
+  `*_coulter_sample_annotation/metadata.csv` (Coulter). Inspects the experiment's annotation schema (conditions,
   drugs, time points), generates a short plotting driver from the bundled toolkit, runs it, and
   shows the figures for fine-tuning.
 ---
 
 # Plot a compiled biophysics experiment
 
-Turn one experiment's **compiled + annotated** data into the standard figure grid. You generate a
-short driver on top of the bundled `biophys_plot_toolkit.py`; the user fine-tunes it afterward in
-normal Claude Code. This skill plots — it does **not** re-run the heavy analysis pipeline.
+Turn one experiment's **compiled + annotated** data into a figure grid. The toolkit inspects
+whatever hand-added annotation columns exist, classifies each into a **role**, and uses those roles
+to group / compare / order / color the data — so plots adapt to each experiment's schema instead of
+a fixed condition/drug/time set. You generate a short driver on top of the bundled
+`biophys_plot_toolkit.py`; the user fine-tunes it afterward. This skill plots — it does **not**
+re-run the heavy analysis pipeline.
 
 Bundled files (reference via `${CLAUDE_PLUGIN_ROOT}/skills/plot-experiment/`):
-- `biophys_plot_toolkit.py` — the plotting library (loaders, ridge/box/timecourse/scatter, pptx).
+- `biophys_plot_toolkit.py` — the library: loaders → `infer_roles` → low-level `draw_*` →
+  combinators (`plot_grouped`/`compare_groups`/`timecourse_by`/`scatter_by`/`facet`/`cross_groups`)
+  → `build_plan`/`render_plan`/`autoplot` → pptx.
 - `reference_driver.py` — the driver template you adapt.
-- `references/data_schema.md` — the exact h5/metadata schema. **Read it before mapping a schema.**
+- `references/data_schema.md` — the exact xlsx/csv/metadata schema + role table. **Read it first.**
 
 ## Procedure
 
 ### 1. Locate & inspect the input
-Find the experiment's data root: a `<exp>_data/` dir with `coulter/{metadata.csv,data.h5}` and/or
-`ifxm/experiment_data.h5`. If the user only has a raw `*_compiled/` dir, that supplies the `ifxm/`
-half (`experiment_data.h5`); offer to assemble the `<exp>_data/` layout (symlink/copy `ifxm/` and
-point `coulter/` at an `annotate_coulter_samples.py` output). An experiment may have only one half.
+The loaders read the **raw** biophys_helpers outputs directly (no reorg step). Find whichever the
+experiment has (it may have only one):
+- **iFXM** — a `*_compiled/` dir (from `compile_experiment.py`) holding `experiment_data.xlsx`.
+- **Coulter** — a `*_coulter_sample_annotation/` dir (from `annotate_coulter_samples.py`) holding
+  `metadata.csv` plus a single-cell data CSV (its filename is the original input CSV's name).
 
-Read `coulter/metadata.csv` and/or the iFXM `/metadata` to discover the **actual** annotations —
-do not assume the FL5 reference set. Use a quick Python/pandas read:
+Read the `metadata` sheet / `metadata.csv` to discover the **actual** annotations — do not assume
+the FL5 reference set. Use a quick Python/pandas read:
 ```python
 import pandas as pd
-pd.read_csv(r"<exp>_data/coulter/metadata.csv")
-pd.read_hdf(r"<exp>_data/ifxm/experiment_data.h5", "/metadata")
+pd.read_csv(r"<...>_coulter_sample_annotation/metadata.csv")          # Coulter
+pd.read_excel(r"<...>_compiled/experiment_data.xlsx", sheet_name="metadata")  # iFXM
 ```
 
-### 2. Map the schema (report back to the user)
-**Annotation column names and values vary between experiments** — do not assume the reference
-schema. Inspect the actual columns and identify which one plays each role:
-- **sample name** (required), **h5 key** (falls back to sample name if absent),
-- **condition** grouping column, **time** column (decimal hours), **drug** column (optional),
-- iFXM **gate** columns (bm lower/upper, ifxm lower/upper).
+### 2. Infer roles and present the plan (ALWAYS get approval before generating)
+The framework does not assume a fixed schema. It reads **whatever hand-added annotation columns
+exist** and classifies each into a **role** via `tk.infer_roles(records)`:
 
-The loaders take these as keyword arguments (`sample_col`, `key_col`, `condition_col`,
-`time_col`, `drug_col`, `bm_lower_col`, `bm_upper_col`, `ifxm_lower_col`, `ifxm_upper_col`), all
-defaulting to the reference names. If this experiment uses different names, note the mapping so
-you can pass it in step 3. The toolkit degrades gracefully on its own: a **missing condition** →
-one unnamed group; **missing time** → 0.0; **missing drug** → no drug figures; **missing/NaN
-gate** → treated as no cutoff (not "drop everything"). Unknown **condition/drug values** are each
-auto-assigned a distinct color (via `build_color_map`), so arbitrary annotation values plot fine.
+| role | meaning | drives |
+|------|---------|--------|
+| `boolean` | yes/no, true/false, 0/1 (e.g. `is_activated`) | per-value plots **and** a cross-value comparison |
+| `categorical` | low-ish-cardinality strings (e.g. `media`) | per-value plots + comparison + facet |
+| `time` | name like `time_h`/`time_min`/`t_hours`; unit parsed → hours | **sequential ordering** + timecourse x-axis |
+| `ordered` | numeric gradient (e.g. `dose_uM`, `passage`) — **flagged `[CONFIRM]`** | ordered grouping/comparison (after you confirm) |
+| `continuous` | high-cardinality numeric | color/scatter axis only |
+| `label` | `sample_name` / free-text identity | labels only |
+| `structural` | `sheet_name`, `hdf5_key`, `has_*`, `*_gate_*`, … | ignored |
 
-State what you found: distinct condition values, whether a drug arm exists, the set of
-timepoints, replicate count, and which property families are available (coulter `volume`; iFXM
-`mass` / `density` / `vol_cal` / `vol_uncal`). Flag anything missing (no gates, no
-`volume_calibrated`, samples that will be skipped).
+Do this: load the records, run `infer_roles`, build a plan with `tk.build_plan(...)`, and **show
+the user `tk.render_plan(plan)`** — the role of every column, any `[CONFIRM]` gradient guesses, and
+the list of proposed plots. **Always present this and get approval/overrides before generating the
+driver** (this is a hard requirement). The user resolves `[CONFIRM]` columns and can re-map
+anything via `overrides={col: "ordered"|"categorical"|...}`.
 
-**Ask the user for `baseline_density`** (g/mL) for this experiment — it is not stored in any data
-file and is required to compute absolute density. (The FL5 reference experiments used `1.008`.)
-If the user has no density plots / no iFXM data, this can be skipped.
+Behavior to convey: **every** boolean/categorical/approved-ordered column becomes its own grouping
+axis (no cardinality cap — everything is plotted; reorganize on a later pass). Multiple columns are
+handled **independently** by default; cross-products are available on request via `cross_groups`. A
+time column orders samples sequentially and drives timecourses. Gate columns still apply; missing
+gate → no cutoff; samples with no paired block are skipped; uncalibrated samples get an empty
+`vol_cal`.
+
+**Ask the user for `baseline_density`** (g/mL) — not stored in any data file, required for absolute
+density. (FL5 reference used `1.008`.) Skip if no iFXM/density.
 
 ### 3. Generate the driver
-1. Create the analysis output dir (default: alongside the data, or ask). Into it, **copy**
-   `${CLAUDE_PLUGIN_ROOT}/skills/plot-experiment/biophys_plot_toolkit.py`. Copying (rather than
-   importing from the plugin cache) keeps each analysis self-contained, git-committable, and
-   reproducible independent of the plugin install.
-2. Adapt `reference_driver.py` into that dir: set `DATA_DIR`, `FIG_DIR`, `PPTX_OUT`,
-   `BASELINE_DENSITY`, and trim `COULTER_PROPS` / `IFXM_PROPS` / `SCATTER_PAIRS` to what the
-   metadata actually contains. **If the experiment's annotation columns differ from the defaults,
-   pass the mapping to the loaders** (e.g.
-   `tk.load_ifxm(DATA_DIR, baseline_density=BD, condition_col="treatment", time_col="t_hours")`).
-   Keep `import biophys_plot_toolkit as tk` — do **not** inline the helpers. Use `scatter_2d` with
-   records from `load_ifxm_paired` (row-aligned) for any property-vs-property scatter (e.g.
-   mass-vs-density, volume-vs-mass); it renders a per-condition grid of per-sample panels, each a
-   scatter with marginal histograms on both axes. Pass `trim_y="mad"` (or `trim_x`) to tame
-   heavy-tailed axes like density.
+1. Create the analysis output dir. Into it, **copy**
+   `${CLAUDE_PLUGIN_ROOT}/skills/plot-experiment/biophys_plot_toolkit.py` (keeps each analysis
+   self-contained, git-committable, reproducible independent of the plugin install).
+2. Adapt `reference_driver.py` into that dir: set `EXP_NAME`, `COMPILED_DIR` (iFXM) and/or
+   `COULTER_DIR` (Coulter, `None` if absent), `FIG_DIR`, `PPTX_OUT`, `BASELINE_DENSITY`, and set
+   `ROLE_OVERRIDES` to the choices the user made in step 2 (resolving every `[CONFIRM]`). The
+   template's default path is `infer_roles → build_plan → render_plan(print) → autoplot`; keep it
+   for the standard grid, or drive the **explicit combinators** for full control:
+   - `plot_grouped(group_col=…)` — per-group detail (ridge + box).
+   - `compare_groups(group_col=…)` — cross-group comparison; default `agg="per_sample"`, both box
+     and ridge.
+   - `timecourse_by(time_col=…, series_col=…)` — unit-aware, sequentially ordered.
+   - `scatter_by(prop_x, prop_y, group_col=…)` — per-cell scatter + marginals; **pass
+     `load_ifxm_paired` records** (row-aligned).
+   - `cross_groups(cols=(a, b))` — cross-product comparison, on request.
+   - `facet(facet_col=…)` — compact one-figure grid.
+   Keep `import biophys_plot_toolkit as tk` — do **not** inline helpers. No statistical outlier
+   rejection is applied; tame a heavy tail with axis limits in the driver.
 
 ### 4. Run it
-Ensure the deps are available (numpy, pandas, matplotlib, tables/PyTables, python-pptx, Pillow).
+Ensure the deps are available (numpy, pandas, matplotlib, openpyxl, python-pptx, Pillow).
 A conda env spec is bundled at `${CLAUDE_PLUGIN_ROOT}/environment.yaml`
 (`conda env create -f ...` then activate `biophys_plotting`), or reuse an existing analysis env.
-Run the driver. It writes PNGs
-to `<exp>_fig/` following `{datatype}_{metric}_{plottype}[_{cond|drug}].png` (and
-`{datatype}_{propY}_vs_{propX}_scatter[_{cond}].png`) plus `<exp>_figures.pptx`.
+Run the driver. It writes PNGs to `<exp>_fig/` (see the naming grid in `data_schema.md`:
+`{datatype}_{metric}_{plottype}_{col}={value}.png`, `..._by_{col}.png`,
+`{datatype}_{propY}_vs_{propX}[_{col}={value}].png`) plus `<exp>_figures.pptx`.
 
 ### 5. Show & hand off
-Surface the generated figures and the driver path. Tell the user they can now fine-tune the driver
-directly in Claude Code (palettes via `COND_COLORS`/`DRUG_COLORS`, ridge bins/overlap, which
-scatter pairs, figure sizes, etc.) and re-run it — the copied toolkit makes it fully editable.
+Surface the generated figures and the driver path. Tell the user they can fine-tune the driver
+directly in Claude Code (`ROLE_OVERRIDES`, which columns to group/compare/cross, palettes via
+`COND_COLORS`/`DRUG_COLORS`/`BOOL_COLORS`, ridge bins/overlap, scatter pairs, figure sizes) and
+re-run — the copied toolkit makes it fully editable.
 
 ## Gotchas
 - **`baseline_density` has no default** — `load_ifxm` raises without it. Always set it deliberately.
 - **iFXM gating**: `mass` uses `bm_gate`; `density`/`vol_cal`/`vol_uncal` share one mask on the
-  *uncalibrated* volume. `load_ifxm` applies per-property outlier rejection; `load_ifxm_paired`
-  keeps arrays row-aligned (use it for `scatter_2d`).
-- **Starved samples** typically share `time_h == 0`; the toolkit labels them by full `sample_name`
-  so replicates are distinguishable — expected, not a bug.
-- **PyTables (`tables`) is required** to read the pandas HDF5 stores.
-- **Missing drug arm** (e.g. a wt experiment): `drug_split` is a no-op — no drug figures, fine.
-- Two HDF5 conventions coexist: pandas `HDFStore` for DataFrames vs raw `h5py` for `images.h5`
-  (images are not used by these plots).
+  *uncalibrated* volume. No statistical outlier rejection is applied — only non-finite values are
+  dropped. `load_ifxm` gates mass and the volume props with separate masks (so per-property arrays
+  can differ in length); `load_ifxm_paired` uses one shared mask to keep arrays row-aligned — always
+  use it for `scatter_by` (and pass `paired_records=` to `autoplot`), or a scatter's x/y won't pair.
+- **Roles are inferred, not fixed** — `condition`/`time_h`/`drug_name` are just the *reference*
+  column names; any hand-added column works. If a numeric column is misread (gradient vs category),
+  fix it with `ROLE_OVERRIDES`/`overrides=`, not by renaming data.
+- **Booleans** need values in {yes/no, true/false, 0/1}; checkbox columns from the GUI already are.
+- **`openpyxl` is required** to read `experiment_data.xlsx` (Coulter needs only pandas' CSV reader).
+- **Deprecated wrappers** (`ridge_box_by_condition`, `timecourse`, `drug_split`, `scatter_2d`) still
+  exist for old drivers but just call the new combinators with `group_col="condition"/"drug_name"`;
+  prefer the combinators.
+- **iFXM sheets are keyed by `sheet_name`, not `sample_name`** (Excel's 31-char sanitized name);
+  the loaders resolve sheets via the metadata `sheet_name` column automatically.
+- `images.h5` (raw `h5py` BF image stacks, alongside `experiment_data.xlsx`) is **not** used by
+  these plots.
