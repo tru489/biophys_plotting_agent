@@ -403,7 +403,7 @@ def load_ifxm_paired(compiled_dir, baseline_density=_REQUIRED, *, sample_col="sa
                      bm_upper_col="bm_gate_upper", ifxm_lower_col="ifxm_gate_lower",
                      ifxm_upper_col="ifxm_gate_upper", normalizers=VALUE_NORMALIZERS) -> list:
     """Like load_ifxm, but keeps per-cell arrays row-ALIGNED across properties (one shared mask),
-    so a cell's mass / density / volume stay paired. Use for scatter_by / scatter_2d. Samples that
+    so a cell's mass / density / volume stay paired. Use for scatter_by. Samples that
     were not calibrated get an empty `vol_cal` (scatters using it are skipped, not misaligned)."""
     return _load_ifxm_records(
         compiled_dir, baseline_density, sample_col, sheet_col,
@@ -993,33 +993,6 @@ def cross_groups(records, prop, ylabel, datatype, fig_dir, *, cols, roles=None,
         tagged.append(rr)
     compare_groups(tagged, prop, ylabel, datatype, fig_dir, group_col=cross_col, roles=roles,
                    kinds=kinds, agg="per_sample", colors=colors)
-
-
-# ---------------------------------------------------------------------------
-# Deprecated wrappers (old hardcoded drivers, re-expressed over the combinators)
-# ---------------------------------------------------------------------------
-def ridge_box_by_condition(records, prop, ylabel, datatype, fig_dir, cond_colors=None) -> None:
-    """Deprecated: use plot_grouped(group_col='condition')."""
-    plot_grouped(records, prop, ylabel, datatype, fig_dir, group_col="condition", colors=cond_colors)
-
-
-def timecourse(records, prop, ylabel, datatype, fig_dir, cond_colors=None) -> None:
-    """Deprecated: use timecourse_by(series_col='condition')."""
-    timecourse_by(records, prop, ylabel, datatype, fig_dir, series_col="condition", colors=cond_colors)
-
-
-def drug_split(records, prop, ylabel, datatype, fig_dir, drug_colors=None) -> None:
-    """Deprecated: use compare_groups(group_col='drug_name') + timecourse_by(series_col='drug_name')."""
-    recs = [r for r in records if rget(r, "drug_name")]
-    if not recs:
-        return
-    compare_groups(recs, prop, ylabel, datatype, fig_dir, group_col="drug_name", colors=drug_colors)
-    timecourse_by(recs, prop, ylabel, datatype, fig_dir, series_col="drug_name", colors=drug_colors)
-
-
-def scatter_2d(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir, **kw) -> None:
-    """Deprecated: use scatter_by(group_col='condition')."""
-    scatter_by(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir, group_col="condition")
 
 
 # ---------------------------------------------------------------------------

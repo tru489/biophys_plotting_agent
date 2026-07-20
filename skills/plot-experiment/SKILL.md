@@ -119,9 +119,9 @@ re-run — the copied toolkit makes it fully editable.
   fix it with `ROLE_OVERRIDES`/`overrides=`, not by renaming data.
 - **Booleans** need values in {yes/no, true/false, 0/1}; checkbox columns from the GUI already are.
 - **`openpyxl` is required** to read `experiment_data.xlsx` (Coulter needs only pandas' CSV reader).
-- **Deprecated wrappers** (`ridge_box_by_condition`, `timecourse`, `drug_split`, `scatter_2d`) still
-  exist for old drivers but just call the new combinators with `group_col="condition"/"drug_name"`;
-  prefer the combinators.
+- **No fixed-role drivers** — always use the column-parameterized combinators (`plot_grouped`,
+  `compare_groups`, `timecourse_by`, `scatter_by`, `facet`, `cross_groups`) or `autoplot`; there is
+  no `ridge_box_by_condition`/`drug_split`/`scatter_2d`.
 - **iFXM sheets are keyed by `sheet_name`, not `sample_name`** (Excel's 31-char sanitized name);
   the loaders resolve sheets via the metadata `sheet_name` column automatically.
 - `images.h5` (raw `h5py` BF image stacks, alongside `experiment_data.xlsx`) is **not** used by
