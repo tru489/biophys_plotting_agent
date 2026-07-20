@@ -36,9 +36,11 @@ OUT_ROOT = COMPILED_DIR.parent if COMPILED_DIR else COULTER_DIR.parent
 FIG_DIR  = OUT_ROOT / f"{EXP_NAME}_fig"
 PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_figures.pptx"
 
-# REQUIRED, per-experiment. Fluid baseline (g/mL) added to measured buoyant density to get the
-# absolute density. It is NOT stored in any data file and varies between experiments — set it
-# deliberately. (The FL5 reference experiments used 1.008.)
+# Fluid baseline (g/mL) added to measured buoyant density to get absolute density. NOT stored in any
+# data file; varies between experiments — set it deliberately. (FL5 reference used 1.008.) Needed
+# only for paired iFXM density; a mass-only / volume-only experiment can leave it as-is (unused).
+# Paired runs use the matched pair_ block; mass-only / volume-only runs fall back to the standalone
+# mass_/vol_ blocks automatically, so they plot too (density/scatter need pairing and are skipped).
 BASELINE_DENSITY = 1.008
 
 # Axis labels for each property (also selects which props to plot). Trim to what exists.

@@ -67,11 +67,17 @@ Behavior to convey: **every** boolean/categorical/approved-ordered column become
 axis (no cardinality cap — everything is plotted; reorganize on a later pass). Multiple columns are
 handled **independently** by default; cross-products are available on request via `cross_groups`. A
 time column orders samples sequentially and drives timecourses. Gate columns still apply; missing
-gate → no cutoff; samples with no paired block are skipped; uncalibrated samples get an empty
-`vol_cal`.
+gate → no cutoff; uncalibrated samples get an empty `vol_cal`.
+
+**Unpaired runs are supported.** A paired sample uses its matched `pair_` block (unchanged); a
+**mass-only** run (`mass` only) or **volume-only** run (`vol_uncal`/`vol_cal` only) falls back to the
+standalone `mass_`/`vol_` blocks, so those samples still plot. `density` and `scatter_by` need
+pairing, so they simply don't appear for unpaired samples — `build_plan` omits plots for absent
+properties automatically.
 
 **Ask the user for `baseline_density`** (g/mL) — not stored in any data file, required for absolute
-density. (FL5 reference used `1.008`.) Skip if no iFXM/density.
+density (paired iFXM). (FL5 reference used `1.008`.) It can be omitted for a mass-only / volume-only
+experiment with no density.
 
 ### 3. Generate the driver
 1. Create the analysis output dir. Into it, **copy**
@@ -108,7 +114,9 @@ directly in Claude Code (`ROLE_OVERRIDES`, which columns to group/compare/cross,
 re-run — the copied toolkit makes it fully editable.
 
 ## Gotchas
-- **`baseline_density` has no default** — `load_ifxm` raises without it. Always set it deliberately.
+- **`baseline_density` has no default** — needed for paired density; `load_ifxm` raises **lazily**
+  (only when a paired block is read), so set it deliberately for any paired experiment. A mass-only /
+  volume-only experiment can omit it.
 - **iFXM gating**: `mass` uses `bm_gate`; `density`/`vol_cal`/`vol_uncal` share one mask on the
   *uncalibrated* volume. No statistical outlier rejection is applied — only non-finite values are
   dropped. `load_ifxm` gates mass and the volume props with separate masks (so per-property arrays

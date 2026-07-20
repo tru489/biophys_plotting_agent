@@ -61,35 +61,41 @@ used by the toolkit:
 Each sample's worksheet (looked up by `sheet_name`) holds up to **three side-by-side blocks**
 separated by one blank spacer column, distinguished by a column-name prefix:
 
-- `vol_*` — every FXM cell (unpaired): `vol_transit_index`, `vol_volume_au`, `vol_volume_fL`.
-- `mass_*` — every SMR cell (unpaired): `mass_mass_pg` (+ any other mass columns).
-- `pair_*` — **matched cells, row-aligned per cell** — this is the only block the toolkit reads:
-  `pair_transit_index`, `pair_mass_pg`, `pair_volume_au`, `pair_volume_fL` (calibrated volume,
-  present **only** when a Coulter calibration ran), `pair_buoyant_density`.
+- `vol_*` — every FXM cell (unpaired): `vol_transit_index`, `vol_volume_au`, `vol_volume_fL`
+  (fL only when calibrated).
+- `mass_*` — every SMR cell (unpaired): `mass_mass_pg` (+ any pass-through columns from the mass CSV).
+- `pair_*` — **matched cells, row-aligned per cell**: `pair_transit_index`, `pair_mass_pg`,
+  `pair_volume_au`, `pair_volume_fL` (calibrated volume, present **only** when a Coulter calibration
+  ran), `pair_buoyant_density`.
 
-Read a sample's paired block with `sheet.filter(regex="^pair_").dropna(how="all")` (use an anchored
-`^pair_`, since `mass_` also occurs inside `pair_mass_pg`). If a paired block overflowed Excel's row
-limit it is written full to `{sheet_name}_pair_overflow.csv` and truncated in the sheet; the loaders
-prefer the overflow CSV when present. Samples with **no paired block** are skipped (e.g. a no-iFXM
-proliferating control).
+Blocks are independent: a **paired run** has all three; a **mass-only run** has only `mass_*`; a
+**volume-only run** has only `vol_*`. Read a block with `sheet.filter(regex="^pair_").dropna(how="all")`
+(use an **anchored** `^pair_`/`^mass_`/`^vol_`, since `mass_` also occurs inside `pair_mass_pg`). If
+a block overflowed Excel's row limit it is written full to `{sheet_name}_{prefix}_overflow.csv` and
+truncated in the sheet; the loaders prefer the overflow CSV when present.
 
-Derived properties (as built by the loaders, all from the one `pair_` block):
+Derived properties, and where the loader sources each:
 
-| prop key    | source (pair_ block, prefix stripped)     | gate            | units  |
-|-------------|-------------------------------------------|-----------------|--------|
-| `mass`      | `mass_pg`                                 | `bm_gate`       | pg     |
-| `density`   | `buoyant_density + baseline_density`      | `ifxm_gate`     | g/mL   |
-| `vol_cal`   | `volume_fL` (empty if uncalibrated)       | `ifxm_gate`     | fL     |
-| `vol_uncal` | `volume_au`                               | `ifxm_gate`     | AU     |
+| prop key    | paired sample (has `pair_`)             | unpaired sample (mass-only / volume-only) | gate        | units |
+|-------------|------------------------------------------|-------------------------------------------|-------------|-------|
+| `mass`      | `pair_mass_pg`                           | `mass_mass_pg` (full SMR distribution)    | `bm_gate`   | pg    |
+| `density`   | `pair_buoyant_density + baseline_density`| — (empty; density **requires pairing**)   | `ifxm_gate` | g/mL  |
+| `vol_cal`   | `pair_volume_fL` (empty if uncalibrated) | `vol_volume_fL` (empty if uncalibrated)   | `ifxm_gate` | fL    |
+| `vol_uncal` | `pair_volume_au`                         | `vol_volume_au` (full FXM distribution)   | `ifxm_gate` | AU    |
 
-The three iFXM `ifxm_gate` properties share **one** mask computed on the uncalibrated `volume_au`
-(cells are row-aligned within the paired block). Do not re-gate per property.
+**Paired-primary, standalone-fallback**: when a sample has a `pair_` block, marginal `mass`/`vol_*`
+come from that matched subset (unchanged behavior); the standalone `mass_`/`vol_` blocks are used
+**only** when there is no `pair_` block. `scatter_by` (via `load_ifxm_paired`) uses the `pair_` block
+only, so unpaired samples never appear in scatters. In the paired loader the props share **one** mask
+on the uncalibrated `pair_volume_au` (row-aligned); in the distribution loader each prop is gated and
+cleaned independently.
 
 ### `baseline_density` — not in any file
 
 `density = buoyant_density + baseline_density`. `buoyant_density` (`pair_buoyant_density`) is
 **RELATIVE**; the baseline (g/mL) is **experiment-specific and stored nowhere in the data**.
-`load_ifxm` requires it explicitly (no default). The skill must ask the user for the correct value
+`load_ifxm` requires it **lazily** — only when a paired block's density is actually read — so a
+mass-only / volume-only experiment (no density) can omit it. The skill asks the user for the value
 per experiment. The FL5 reference experiments used `1.008`.
 
 ## Annotation columns are arbitrary — roles are inferred, not fixed

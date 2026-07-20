@@ -22,9 +22,12 @@ The loaders read the RAW biophys_helpers outputs directly (no reorg step):
             a single-cell data CSV; columns are samples, rows are per-cell volumes).
             One property "volume" (fL, gated upstream).
   iFXM    — compile_experiment.py's '*_compiled/experiment_data.xlsx' (a 'metadata' sheet + one
-            worksheet per sample). Each sample's PAIRED ('pair_') block gives, row-aligned:
+            worksheet per sample). A sample's PAIRED ('pair_') block gives, row-aligned:
             mass (pair_mass_pg, pg), density (pair_buoyant_density + baseline_density),
-            vol_uncal (pair_volume_au), vol_cal (pair_volume_fL, only when calibrated).
+            vol_uncal (pair_volume_au), vol_cal (pair_volume_fL, only when calibrated). A sample
+            with no paired block (mass-only / volume-only run) falls back to the standalone MASS
+            ('mass_') and/or VOLUME ('vol_') blocks for the distribution props (density needs
+            pairing, so it is empty there). scatter (load_ifxm_paired) uses paired samples only.
 
 No statistical outlier rejection is applied anywhere — the loaders drop only non-finite (NaN/inf)
 values. The only intentional data exclusions are the metadata-driven gates (bm_gate / ifxm_gate)
@@ -222,12 +225,20 @@ def color_map_for(records, col, roles=None, base=None):
 # Loaders  ->  list of records {sample, props:{name: arr}, meta:{col: value, ..., rep}}
 # ---------------------------------------------------------------------------
 
-# Columns inside the PAIRED ('pair_'-prefixed) block of each iFXM sample sheet, after the 'pair_'
-# prefix is stripped. This is the compile_experiment.py output contract (_build_paired_block).
+# Columns inside each iFXM sample sheet's blocks, after the block prefix is stripped. This is the
+# compile_experiment.py output contract. Each sample sheet holds up to three side-by-side blocks:
+#   PAIRED ('pair_')  — matched cells, row-aligned: mass_pg, buoyant_density, volume_au, volume_fL.
+#   MASS   ('mass_')  — every SMR cell (unpaired): mass_pg (+ pass-through mass_* columns).
+#   VOLUME ('vol_')   — every FXM cell (unpaired): volume_au, volume_fL.
+# Density is pairing-only; the standalone blocks never carry it.
 _PAIR_MASS = "mass_pg"          # buoyant mass (pg)          (was 'matched_mass' in the old h5)
 _PAIR_DENS = "buoyant_density"  # RELATIVE density (g/mL); absolute = + baseline_density
 _PAIR_VUN  = "volume_au"        # uncalibrated volume (AU)   (was 'volume' in the old h5)
 _PAIR_VCAL = "volume_fL"        # calibrated volume (fL); present ONLY when a calibration ran
+# Standalone-block value columns (after the 'mass_'/'vol_' prefix is stripped):
+_MASS_STANDALONE = "mass_pg"    # MASS block buoyant mass (pg)   -> 'mass_mass_pg' on the sheet
+_VOL_UNCAL = "volume_au"        # VOLUME block uncalibrated (AU) -> 'vol_volume_au'
+_VOL_CAL   = "volume_fL"        # VOLUME block calibrated (fL)   -> 'vol_volume_fL' (if calibrated)
 
 
 def _find_coulter_data_csv(d: Path, meta_path: Path) -> Path:
@@ -299,30 +310,55 @@ def _open_ifxm_xlsx(compiled_dir) -> Path:
     return xlsx
 
 
-def _read_paired_block(xls, xlsx_path: Path, sheet_name) -> pd.DataFrame:
-    """PAIRED block of one sample sheet as a DataFrame (row-aligned per cell, 'pair_' prefix
-    stripped), or None if the sample has no paired data. A block that overflowed Excel's row limit
-    is written by compile_experiment.py to a sibling '{sheet}_pair_overflow.csv'; prefer it."""
-    overflow = Path(xlsx_path).parent / f"{sheet_name}_pair_overflow.csv"
+def _read_block(xls, xlsx_path: Path, sheet_name, prefix, _sheet_cache=None) -> pd.DataFrame:
+    """One prefixed block ('pair'|'mass'|'vol') of a sample sheet as a DataFrame (rows dropped where
+    all block columns are NaN, prefix stripped), or None if that block is absent. A block that
+    overflowed Excel's row limit is written by compile_experiment.py to a sibling
+    '{sheet}_{prefix}_overflow.csv'; that full copy is preferred when present. `_sheet_cache` is an
+    optional {sheet_name: DataFrame} dict so the three blocks of a sheet share one read_excel."""
+    overflow = Path(xlsx_path).parent / f"{sheet_name}_{prefix}_overflow.csv"
     if overflow.exists():
         blk = pd.read_csv(overflow)
     else:
-        sheet = pd.read_excel(xls, sheet_name=sheet_name)
-        blk = sheet.filter(regex=r"^pair_").dropna(how="all")
+        if _sheet_cache is not None and sheet_name in _sheet_cache:
+            sheet = _sheet_cache[sheet_name]
+        else:
+            sheet = pd.read_excel(xls, sheet_name=sheet_name)
+            if _sheet_cache is not None:
+                _sheet_cache[sheet_name] = sheet
+        blk = sheet.filter(regex=rf"^{prefix}_").dropna(how="all")
     if blk.empty:
         return None
-    blk = blk.rename(columns=lambda c: c[len("pair_"):] if str(c).startswith("pair_") else c)
+    pre = f"{prefix}_"
+    blk = blk.rename(columns=lambda c: c[len(pre):] if str(c).startswith(pre) else c)
     return blk
+
+
+_EMPTY = np.array([], dtype=float)
+
+
+def _require_baseline(baseline_density):
+    if baseline_density is _REQUIRED:
+        raise ValueError(
+            "baseline_density (g/mL) is required to compute density from a paired block — it varies "
+            "per experiment and is not stored in the data files. Set it in your driver. (It can be "
+            "omitted only for a mass-only / volume-only experiment with no paired iFXM data.)")
+    return baseline_density
+
+
+def _gate_clean(a, mask):
+    """Apply a keep-mask (if lengths match) then drop non-finite. Empty arrays pass through."""
+    a = a[mask] if a.size == mask.size else a
+    return a[np.isfinite(a)]
 
 
 def _load_ifxm_records(compiled_dir, baseline_density, sample_col, sheet_col, gate_cols,
                        normalizers, paired):
-    """Shared iFXM reader. `paired`=True keeps all props row-aligned under one mask (for scatter);
-    False gates mass and the volume props with separate masks (per-property arrays may differ)."""
-    if baseline_density is _REQUIRED:
-        raise ValueError(
-            "load_ifxm requires baseline_density (g/mL) — it varies per experiment and is not "
-            "stored in the data files. Set it explicitly at the top of your driver.")
+    """Shared iFXM reader. `paired`=True keeps all props row-aligned under one mask from the PAIRED
+    block (for scatter); unpaired samples are skipped. `paired`=False builds distribution props:
+    from the PAIRED block when present (matched subset — unchanged), else falling back to the
+    standalone MASS / VOLUME blocks so mass-only and volume-only runs still load (density stays
+    pairing-only)."""
     bm_lo_c, bm_hi_c, ix_lo_c, ix_hi_c = gate_cols
     xlsx = _open_ifxm_xlsx(compiled_dir)
     recs = []
@@ -330,50 +366,71 @@ def _load_ifxm_records(compiled_dir, baseline_density, sample_col, sheet_col, ga
         meta = pd.read_excel(xls, sheet_name="metadata")
         _require_col(meta, sample_col, "sample-name")
         skey = sheet_col if sheet_col in meta.columns else sample_col
+        cache = {}
 
         for _, r in meta.iterrows():
-            blk = _read_paired_block(xls, xlsx, r[skey])
-            if blk is None or _PAIR_MASS not in blk.columns or _PAIR_VUN not in blk.columns:
-                continue  # no usable paired iFXM data for this sample
-            mass = blk[_PAIR_MASS].to_numpy(dtype=float)
-            dens = blk[_PAIR_DENS].to_numpy(dtype=float) + baseline_density
-            vun  = blk[_PAIR_VUN].to_numpy(dtype=float)
-            has_cal = _PAIR_VCAL in blk.columns
-            vcal = blk[_PAIR_VCAL].to_numpy(dtype=float) if has_cal else np.array([], dtype=float)
+            pair = _read_block(xls, xlsx, r[skey], "pair", cache)
+            has_pair = pair is not None and _PAIR_MASS in pair.columns and _PAIR_VUN in pair.columns
+
+            if paired and not has_pair:
+                continue  # scatter needs a paired block; unpaired samples have no row-aligned pairs
 
             bm_lo = _gate_bound(r, bm_lo_c, -np.inf)
             bm_hi = _gate_bound(r, bm_hi_c,  np.inf)
             ix_lo = _gate_bound(r, ix_lo_c, -np.inf)
             ix_hi = _gate_bound(r, ix_hi_c,  np.inf)
-
             sample = _get(r, sample_col, "")
             meta_bag = _build_meta(r, sample, normalizers)
 
-            if paired:
-                # single mask over always-present props keeps them length-matched & row-aligned;
-                # vcal (finite wherever volume_au is) rides along under the same mask.
-                mask = (np.isfinite(mass) & np.isfinite(dens) & np.isfinite(vun)
-                        & (mass >= bm_lo) & (mass <= bm_hi)
-                        & (vun >= ix_lo) & (vun <= ix_hi))
-                props = {
-                    "mass":      mass[mask],
-                    "density":   dens[mask],
-                    "vol_cal":   vcal[mask] if has_cal else np.array([], dtype=float),
-                    "vol_uncal": vun[mask],
-                }
+            if has_pair:
+                mass = pair[_PAIR_MASS].to_numpy(dtype=float)
+                dens = pair[_PAIR_DENS].to_numpy(dtype=float) + _require_baseline(baseline_density)
+                vun  = pair[_PAIR_VUN].to_numpy(dtype=float)
+                has_cal = _PAIR_VCAL in pair.columns
+                vcal = pair[_PAIR_VCAL].to_numpy(dtype=float) if has_cal else _EMPTY
+
+                if paired:
+                    # single mask over always-present props keeps them length-matched & row-aligned;
+                    # vcal (finite wherever volume_au is) rides along under the same mask.
+                    mask = (np.isfinite(mass) & np.isfinite(dens) & np.isfinite(vun)
+                            & (mass >= bm_lo) & (mass <= bm_hi)
+                            & (vun >= ix_lo) & (vun <= ix_hi))
+                    props = {
+                        "mass":      mass[mask],
+                        "density":   dens[mask],
+                        "vol_cal":   vcal[mask] if has_cal else _EMPTY,
+                        "vol_uncal": vun[mask],
+                    }
+                else:
+                    bm_mask = np.isfinite(mass) & (mass >= bm_lo) & (mass <= bm_hi)
+                    ix_mask = np.isfinite(vun) & (vun >= ix_lo) & (vun <= ix_hi)
+                    props = {
+                        "mass":      _gate_clean(mass, bm_mask),
+                        "density":   _gate_clean(dens, ix_mask),
+                        "vol_cal":   _gate_clean(vcal, ix_mask),
+                        "vol_uncal": _gate_clean(vun, ix_mask),
+                    }
             else:
+                # Unpaired sample (mass-only / volume-only): fall back to the standalone blocks.
+                massblk = _read_block(xls, xlsx, r[skey], "mass", cache)
+                volblk  = _read_block(xls, xlsx, r[skey], "vol", cache)
+                if massblk is None and volblk is None:
+                    continue  # sample has no tabular iFXM data at all
+
+                mass = massblk[_MASS_STANDALONE].to_numpy(dtype=float) \
+                    if massblk is not None and _MASS_STANDALONE in massblk.columns else _EMPTY
+                vun = volblk[_VOL_UNCAL].to_numpy(dtype=float) \
+                    if volblk is not None and _VOL_UNCAL in volblk.columns else _EMPTY
+                vcal = volblk[_VOL_CAL].to_numpy(dtype=float) \
+                    if volblk is not None and _VOL_CAL in volblk.columns else _EMPTY
+
                 bm_mask = np.isfinite(mass) & (mass >= bm_lo) & (mass <= bm_hi)
-                ifxm_mask = np.isfinite(vun) & (vun >= ix_lo) & (vun <= ix_hi)
-
-                def clean(a, m):
-                    a = a[m] if a.size == m.size else a  # vcal may be empty when uncalibrated
-                    return a[np.isfinite(a)]
-
+                ix_mask = np.isfinite(vun) & (vun >= ix_lo) & (vun <= ix_hi)
                 props = {
-                    "mass":      clean(mass, bm_mask),
-                    "density":   clean(dens, ifxm_mask),
-                    "vol_cal":   clean(vcal, ifxm_mask),
-                    "vol_uncal": clean(vun, ifxm_mask),
+                    "mass":      _gate_clean(mass, bm_mask),
+                    "density":   _EMPTY,               # density requires pairing
+                    "vol_cal":   _gate_clean(vcal, ix_mask),
+                    "vol_uncal": _gate_clean(vun, ix_mask),
                 }
             recs.append({"sample": sample, "props": props, "meta": meta_bag})
     return recs
@@ -383,15 +440,20 @@ def load_ifxm(compiled_dir, baseline_density=_REQUIRED, *, sample_col="sample_na
               sheet_col="sheet_name", bm_lower_col="bm_gate_lower", bm_upper_col="bm_gate_upper",
               ifxm_lower_col="ifxm_gate_lower", ifxm_upper_col="ifxm_gate_upper",
               normalizers=VALUE_NORMALIZERS) -> list:
-    """Load paired iFXM data from a '*_compiled/' dir's experiment_data.xlsx (compile_experiment.py).
+    """Load iFXM distribution data from a '*_compiled/' dir's experiment_data.xlsx.
 
-    baseline_density (REQUIRED): fluid baseline added to the measured RELATIVE buoyant density to
-    get absolute density (g/mL). Not stored in the data — supply it explicitly.
+    baseline_density: fluid baseline added to the measured RELATIVE buoyant density to get absolute
+    density (g/mL). Not stored in the data — supply it whenever the experiment has paired iFXM data.
+    It is required lazily: only raises if a PAIRED block is actually read, so a mass-only /
+    volume-only experiment can omit it.
 
-    Reads the 'metadata' sheet, then each sample's PAIRED ('pair_') block from the worksheet named
-    by `sheet_col`. Samples with no paired block are skipped; samples without pair_volume_fL simply
-    have an empty `vol_cal`. Mass is gated by the bm gate; density / vol_cal / vol_uncal share one
-    mask on the uncalibrated volume. Every metadata column is carried into each record's `meta`.
+    For each sample (worksheet named by `sheet_col`): if it has a PAIRED ('pair_') block, mass /
+    density / vol_cal / vol_uncal come from that matched subset (mass bm-gated; the others ifxm-gated
+    on the uncalibrated volume). If it has NO paired block (a mass-only or volume-only run), the
+    standalone MASS ('mass_') and/or VOLUME ('vol_') blocks are used instead — `mass` from the full
+    SMR distribution and/or `vol_uncal`/`vol_cal` from the full FXM distribution, with `density`
+    empty (density requires pairing). Samples with no tabular iFXM data are skipped. Every metadata
+    column is carried into each record's `meta`.
     """
     return _load_ifxm_records(
         compiled_dir, baseline_density, sample_col, sheet_col,
@@ -402,9 +464,11 @@ def load_ifxm_paired(compiled_dir, baseline_density=_REQUIRED, *, sample_col="sa
                      sheet_col="sheet_name", bm_lower_col="bm_gate_lower",
                      bm_upper_col="bm_gate_upper", ifxm_lower_col="ifxm_gate_lower",
                      ifxm_upper_col="ifxm_gate_upper", normalizers=VALUE_NORMALIZERS) -> list:
-    """Like load_ifxm, but keeps per-cell arrays row-ALIGNED across properties (one shared mask),
-    so a cell's mass / density / volume stay paired. Use for scatter_by. Samples that
-    were not calibrated get an empty `vol_cal` (scatters using it are skipped, not misaligned)."""
+    """Like load_ifxm, but keeps per-cell arrays row-ALIGNED across properties (one shared mask from
+    the PAIRED block), so a cell's mass / density / volume stay paired. Use for scatter_by. Only
+    samples with a paired block appear (unpaired mass-only / volume-only samples are skipped — there
+    is nothing to correlate); samples not calibrated get an empty `vol_cal` (scatters using it are
+    skipped, not misaligned). baseline_density is always needed here (density is always read)."""
     return _load_ifxm_records(
         compiled_dir, baseline_density, sample_col, sheet_col,
         (bm_lower_col, bm_upper_col, ifxm_lower_col, ifxm_upper_col), normalizers, paired=True)
@@ -1003,9 +1067,12 @@ def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
     """Infer a plot plan (list of PlotSpecs) from the column roles. For every boolean / categorical
     (and, if include_ordered, approved ordered) column: a plot_grouped + a compare_groups per prop.
     If a time column exists: a timecourse per prop, split by each grouping column. Scatters are
-    added for scatter_pairs. Returns {roles, props, plots:[{fn,prop,kwargs,rationale}]}."""
+    added for scatter_pairs. `props` is filtered to those non-empty in at least one record, so a
+    mass-only / volume-only experiment proposes no no-op plots for absent properties. Returns
+    {roles, props, plots:[{fn,prop,kwargs,rationale}]}."""
     roles = roles or infer_roles(records)
-    props = props or [p for p in {k for r in records for k in r["props"]}]
+    present = {k for r in records for k, v in r["props"].items() if len(v) > 0}
+    props = [p for p in (props if props is not None else present) if p in present]
     time_col = _find_time_col(records, roles)
 
     group_cols = [c for c, i in roles.items()
@@ -1028,6 +1095,8 @@ def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
                               "kwargs": {"time_col": time_col, "series_col": gc},
                               "rationale": f"timecourse over {time_col}, split by {gc}"})
     for (px, py, xl, yl) in (scatter_pairs or []):
+        if px not in present or py not in present:
+            continue  # e.g. a mass-only experiment has no density/volume to scatter against
         gc = group_cols[0] if group_cols else None
         plots.append({"fn": "scatter_by", "prop": f"{py}_vs_{px}",
                       "kwargs": {"prop_x": px, "prop_y": py, "xlabel": xl, "ylabel": yl,
