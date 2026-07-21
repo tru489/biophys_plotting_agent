@@ -113,13 +113,46 @@ directly in Claude Code (`ROLE_OVERRIDES`, which columns to group/compare/cross,
 `COND_COLORS`/`DRUG_COLORS`/`BOOL_COLORS`, ridge bins/overlap, scatter pairs, figure sizes) and
 re-run — the copied toolkit makes it fully editable.
 
+## Outlier rejection (opt-in — the loaders never trim data)
+
+By default **no statistical outlier rejection** is applied — the data is loaded verbatim so the user
+can decide per experiment / per sample. The toolkit provides an opt-in transform, `reject_outliers`,
+that returns cleaned records feeding straight into `build_plan`/`autoplot`/any combinator, so one
+call cleans every downstream plot.
+
+**When the user brings up outlier rejection at all** (e.g. "add outlier rejection", "trim the density
+tails", "reject outliers on volume"), do **not** guess — present a menu with `AskUserQuestion`
+enumerating the full spec, then wire the answer into the driver. Ask for:
+
+1. **Which properties** to clean — any of coulter `volume`; iFXM `mass` / `density` / `vol_cal` /
+   `vol_uncal` (multi-select; can differ per property).
+2. **Method** (per property allowed): `mad` (modified z-score, robust — best for density),
+   `iqr` (Tukey fences, robust, matches the box whiskers), `percentile` (fixed-fraction tail clip).
+3. **Scope**: `per_sample` (each sample trimmed on its own stats — default) or `pooled` (one
+   global cutoff across all cells).
+4. **Log-space?** (`log=True`) — for log-normal mass/volume so the high tail isn't over-trimmed.
+5. **Method params** if they care — `mad thresh` (3.5), `iqr k` (1.5), `percentile lower/upper`
+   (1/99).
+
+Then add lines to the driver (and re-run):
+```python
+ifxm        = tk.reject_outliers(ifxm, method={"density": "mad", "mass": "iqr"}, scope="per_sample")
+ifxm_paired = tk.reject_outliers(ifxm_paired, method="mad", props=["density"], paired=True)  # scatter
+coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"])
+```
+Notes: apply to the **scatter** records (`ifxm_paired`) with `paired=True` so a cell's props stay
+row-aligned; for the distribution records use the plain call. `verbose=True` prints how many cells
+each sample dropped. Low-level keep-masks (`tk.outlier_mask`, `keep_mad`/`keep_iqr`/`keep_percentile`)
+are exposed for bespoke logic. (k-sigma/3-std is intentionally not built in — ask if the user wants it.)
+
 ## Gotchas
 - **`baseline_density` has no default** — needed for paired density; `load_ifxm` raises **lazily**
   (only when a paired block is read), so set it deliberately for any paired experiment. A mass-only /
   volume-only experiment can omit it.
 - **iFXM gating**: `mass` uses `bm_gate`; `density`/`vol_cal`/`vol_uncal` share one mask on the
-  *uncalibrated* volume. No statistical outlier rejection is applied — only non-finite values are
-  dropped. `load_ifxm` gates mass and the volume props with separate masks (so per-property arrays
+  *uncalibrated* volume. No statistical outlier rejection is applied by the loaders — only non-finite
+  values are dropped (see the opt-in `reject_outliers` above for trimming).
+  `load_ifxm` gates mass and the volume props with separate masks (so per-property arrays
   can differ in length); `load_ifxm_paired` uses one shared mask to keep arrays row-aligned — always
   use it for `scatter_by` (and pass `paired_records=` to `autoplot`), or a scatter's x/y won't pair.
 - **Roles are inferred, not fixed** — `condition`/`time_h`/`drug_name` are just the *reference*

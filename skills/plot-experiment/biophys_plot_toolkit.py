@@ -475,6 +475,149 @@ def load_ifxm_paired(compiled_dir, baseline_density=_REQUIRED, *, sample_col="sa
 
 
 # ---------------------------------------------------------------------------
+# Outlier rejection — OPT-IN. The loaders NEVER call these; the data is loaded verbatim (only
+# non-finite values + metadata gates removed). Call reject_outliers yourself, per experiment or
+# per sample, to trim distributions for visualization. Each method derives keep-bounds (lo, hi)
+# from a reference array, so 'per_sample' vs 'pooled' is the same code with a different reference.
+# ---------------------------------------------------------------------------
+_OUTLIER_DEFAULTS = {
+    "mad":        {"thresh": 3.5},          # modified z-score: |0.6745*(x-median)/MAD| <= thresh
+    "iqr":        {"k": 1.5},               # Tukey fences: [Q1 - k*IQR, Q3 + k*IQR]
+    "percentile": {"lower": 1.0, "upper": 99.0},   # drop below `lower` / above `upper` percentile
+}
+
+
+def _outlier_bounds(ref: np.ndarray, method: str, params: dict):
+    """Keep-bounds (lo, hi) in the working space, from finite reference values `ref`."""
+    p = dict(_OUTLIER_DEFAULTS[method], **(params or {}))
+    if ref.size == 0:
+        return -np.inf, np.inf
+    if method == "mad":
+        med = np.median(ref)
+        mad = np.median(np.abs(ref - med))
+        if mad == 0:
+            return -np.inf, np.inf
+        half = p["thresh"] * mad / 0.6745
+        return med - half, med + half
+    if method == "iqr":
+        q1, q3 = np.percentile(ref, [25, 75])
+        iqr = q3 - q1
+        return q1 - p["k"] * iqr, q3 + p["k"] * iqr
+    if method == "percentile":
+        lo = np.percentile(ref, p["lower"]) if p["lower"] > 0 else -np.inf
+        hi = np.percentile(ref, p["upper"]) if p["upper"] < 100 else np.inf
+        return lo, hi
+    raise ValueError(f"unknown outlier method {method!r} (use 'mad', 'iqr', or 'percentile')")
+
+
+def _to_outlier_space(a, log):
+    """Values in the working space + a validity mask. log-space keeps strictly-positive finites."""
+    a = np.asarray(a, float)
+    finite = np.isfinite(a)
+    if not log:
+        return a, finite
+    valid = finite & (a > 0)
+    out = np.full(a.shape, np.nan)
+    out[valid] = np.log(a[valid])
+    return out, valid
+
+
+def outlier_mask(a, method="iqr", *, log=False, ref=None, **params) -> np.ndarray:
+    """Boolean KEEP-mask for 1-D `a` (True = keep). Bounds are computed from `ref` (default: `a`
+    itself → per-sample). method: 'mad' | 'iqr' | 'percentile'. params (override the defaults):
+    mad `thresh=3.5`; iqr `k=1.5`; percentile `lower=1, upper=99`. `log=True` computes bounds in
+    log-space (non-positive values are dropped). Non-finite values are always rejected."""
+    vals, valid = _to_outlier_space(a, log)
+    rvals, rvalid = _to_outlier_space(a if ref is None else ref, log)
+    lo, hi = _outlier_bounds(rvals[rvalid], method, params)
+    return valid & (vals >= lo) & (vals <= hi)
+
+
+def keep_mad(a, thresh=3.5, *, log=False, ref=None):
+    return outlier_mask(a, "mad", log=log, ref=ref, thresh=thresh)
+
+
+def keep_iqr(a, k=1.5, *, log=False, ref=None):
+    return outlier_mask(a, "iqr", log=log, ref=ref, k=k)
+
+
+def keep_percentile(a, lower=1.0, upper=99.0, *, log=False, ref=None):
+    return outlier_mask(a, "percentile", log=log, ref=ref, lower=lower, upper=upper)
+
+
+def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="per_sample",
+                    log=False, params=None, verbose=False) -> list:
+    """Return NEW records with outliers removed from the selected props. OPT-IN — nothing is
+    trimmed unless you call this; the returned list feeds straight into build_plan / autoplot /
+    any combinator, so one call cleans every downstream plot.
+
+    method : a method name for all selected props, or a dict {prop: method} (e.g.
+             {"density": "mad", "mass": "iqr"}). See outlier_mask for methods/params.
+    props  : which props to clean (default: every prop present). e.g. ["density"], ["mass","vol_cal"].
+    scope  : 'per_sample' (bounds from each sample's own values; default) or 'pooled' (bounds from
+             every cell of that prop across all records — one global cutoff).
+    paired : True for row-aligned records (load_ifxm_paired): a keep-mask is built from each
+             selected prop, AND-combined, and applied to EVERY prop so a cell's props stay aligned.
+    log    : compute bounds in log-space (for log-normal mass/volume).
+    params : method params applied globally (merged over the method defaults). For different params
+             per prop, call reject_outliers once per props subset.
+    verbose: print how many cells/rows each sample dropped (rejection is never silent).
+
+    Records are copied (never mutated); `meta` is preserved.
+    """
+    if not records:
+        return records
+    present = {k for r in records for k in r["props"]}
+    sel = [p for p in (props if props is not None else present) if p in present]
+    kw = dict(params or {})
+
+    def meth(p):
+        return method[p] if isinstance(method, dict) else method
+
+    pooled_ref = {}
+    if scope == "pooled":
+        for p in sel:
+            arrs = [np.asarray(r["props"].get(p, []), float) for r in records]
+            arrs = [a for a in arrs if a.size]
+            pooled_ref[p] = np.concatenate(arrs) if arrs else np.array([])
+
+    out = []
+    for r in records:
+        newprops = dict(r["props"])
+        if paired:
+            length = next((np.asarray(r["props"][p], float).size for p in sel
+                           if np.asarray(r["props"].get(p, []), float).size), None)
+            if length is None:
+                out.append({**r, "props": newprops})
+                continue
+            keep = np.ones(length, bool)
+            for p in sel:
+                a = np.asarray(r["props"].get(p, []), float)
+                if a.size != length:
+                    continue  # e.g. empty vol_cal (uncalibrated) — don't break the joint mask
+                ref = pooled_ref.get(p) if scope == "pooled" else None
+                keep &= outlier_mask(a, meth(p), log=log, ref=ref, **kw)
+            for p, a in r["props"].items():
+                a = np.asarray(a, float)
+                newprops[p] = a[keep] if a.size == length else a
+            if verbose:
+                print(f"  reject[{r['sample']}] paired: {length - int(keep.sum())}/{length} rows")
+        else:
+            for p in sel:
+                a = np.asarray(r["props"].get(p, []), float)
+                if a.size == 0:
+                    continue
+                ref = pooled_ref.get(p) if scope == "pooled" else None
+                keep = outlier_mask(a, meth(p), log=log, ref=ref, **kw)
+                newprops[p] = a[keep]
+                if verbose:
+                    print(f"  reject[{r['sample']}] {p} ({meth(p)}): "
+                          f"{a.size - int(keep.sum())}/{a.size}")
+        out.append({**r, "props": newprops})
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Role inference — classify each metadata column so plots can be chosen intelligently
 # ---------------------------------------------------------------------------
 DEFAULT_STRUCTURAL = {"sheet_name", "hdf5_key", "coulter_column", "calibration_factor"}
