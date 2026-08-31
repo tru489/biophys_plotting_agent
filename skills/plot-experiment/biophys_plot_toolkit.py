@@ -23,11 +23,16 @@ The loaders read the RAW biophys_helpers outputs directly (no reorg step):
             One property "volume" (fL, gated upstream).
   iFXM    — compile_experiment.py's '*_compiled/experiment_data.xlsx' (a 'metadata' sheet + one
             worksheet per sample). A sample's PAIRED ('pair_') block gives, row-aligned:
-            mass (pair_mass_pg, pg), density (pair_buoyant_density + baseline_density),
-            vol_uncal (pair_volume_au), vol_cal (pair_volume_fL, only when calibrated). A sample
-            with no paired block (mass-only / volume-only run) falls back to the standalone MASS
-            ('mass_') and/or VOLUME ('vol_') blocks for the distribution props (density needs
-            pairing, so it is empty there). scatter (load_ifxm_paired) uses paired samples only.
+            mass (pair_mass_pg, pg), density (pair_buoyant_density + baseline_density), and volume
+            in ONE of two forms depending on how compile_experiment.py paired the sample (never
+            both): legacy CSV-paired samples give vol_uncal (pair_volume_au) + optionally vol_cal
+            (pair_volume_fL, only when a Coulter calibration ran); current-pipeline samples paired
+            straight from a *_CELLGROUPED.hdf5 (no *_ProcessedVolumes.csv) give ONLY vol_cal
+            (pair_volume_fl, already calibrated) with vol_uncal empty (there is no raw-AU reading
+            for them). A sample with no paired block (mass-only / volume-only run) falls back to
+            the standalone MASS ('mass_') and/or VOLUME ('vol_') blocks for the distribution props
+            (density needs pairing, so it is empty there). scatter (load_ifxm_paired) uses paired
+            samples only.
 
 No statistical outlier rejection is applied anywhere — the loaders drop only non-finite (NaN/inf)
 values. The only intentional data exclusions are the metadata-driven gates (bm_gate / ifxm_gate)
@@ -227,14 +232,22 @@ def color_map_for(records, col, roles=None, base=None):
 
 # Columns inside each iFXM sample sheet's blocks, after the block prefix is stripped. This is the
 # compile_experiment.py output contract. Each sample sheet holds up to three side-by-side blocks:
-#   PAIRED ('pair_')  — matched cells, row-aligned: mass_pg, buoyant_density, volume_au, volume_fL.
+#   PAIRED ('pair_')  — matched cells, row-aligned: mass_pg, buoyant_density, and volume in ONE of
+#                       two forms (never both): volume_au (+ optionally volume_fL when Coulter-
+#                       calibrated) for samples paired from a legacy PairedSMRVolumes/
+#                       ProcessedVolumes CSV, or volume_fl (lowercase — already calibrated, no AU
+#                       counterpart) for samples paired straight from a *_CELLGROUPED.hdf5 by
+#                       current SMRFXMAnalysis (no *_ProcessedVolumes.csv exists for those runs).
 #   MASS   ('mass_')  — every SMR cell (unpaired): mass_pg (+ pass-through mass_* columns).
 #   VOLUME ('vol_')   — every FXM cell (unpaired): volume_au, volume_fL.
 # Density is pairing-only; the standalone blocks never carry it.
 _PAIR_MASS = "mass_pg"          # buoyant mass (pg)          (was 'matched_mass' in the old h5)
 _PAIR_DENS = "buoyant_density"  # RELATIVE density (g/mL); absolute = + baseline_density
-_PAIR_VUN  = "volume_au"        # uncalibrated volume (AU)   (was 'volume' in the old h5)
-_PAIR_VCAL = "volume_fL"        # calibrated volume (fL); present ONLY when a calibration ran
+_PAIR_VUN  = "volume_au"        # legacy uncalibrated volume (AU) (was 'volume' in the old h5)
+_PAIR_VCAL = "volume_fL"        # legacy Coulter-calibrated volume (fL); present ONLY if calibrated
+_PAIR_VNAT = "volume_fl"        # CELLGROUPED-hdf5-native volume (fL, already calibrated); the ONLY
+                                 # volume column on a sample paired that way — mutually exclusive
+                                 # with _PAIR_VUN/_PAIR_VCAL on any given sample's pair_ block
 # Standalone-block value columns (after the 'mass_'/'vol_' prefix is stripped):
 _MASS_STANDALONE = "mass_pg"    # MASS block buoyant mass (pg)   -> 'mass_mass_pg' on the sheet
 _VOL_UNCAL = "volume_au"        # VOLUME block uncalibrated (AU) -> 'vol_volume_au'
@@ -370,7 +383,8 @@ def _load_ifxm_records(compiled_dir, baseline_density, sample_col, sheet_col, ga
 
         for _, r in meta.iterrows():
             pair = _read_block(xls, xlsx, r[skey], "pair", cache)
-            has_pair = pair is not None and _PAIR_MASS in pair.columns and _PAIR_VUN in pair.columns
+            has_pair = pair is not None and _PAIR_MASS in pair.columns and (
+                _PAIR_VUN in pair.columns or _PAIR_VNAT in pair.columns)
 
             if paired and not has_pair:
                 continue  # scatter needs a paired block; unpaired samples have no row-aligned pairs
@@ -385,30 +399,42 @@ def _load_ifxm_records(compiled_dir, baseline_density, sample_col, sheet_col, ga
             if has_pair:
                 mass = pair[_PAIR_MASS].to_numpy(dtype=float)
                 dens = pair[_PAIR_DENS].to_numpy(dtype=float) + _require_baseline(baseline_density)
-                vun  = pair[_PAIR_VUN].to_numpy(dtype=float)
-                has_cal = _PAIR_VCAL in pair.columns
-                vcal = pair[_PAIR_VCAL].to_numpy(dtype=float) if has_cal else _EMPTY
+                has_vun = _PAIR_VUN in pair.columns
+                if has_vun:
+                    # Legacy CSV-paired sample: raw-AU volume, optionally also a Coulter-calibrated
+                    # fL column. Gate against the uncalibrated volume, as before.
+                    vun  = pair[_PAIR_VUN].to_numpy(dtype=float)
+                    has_cal = _PAIR_VCAL in pair.columns
+                    vcal = pair[_PAIR_VCAL].to_numpy(dtype=float) if has_cal else _EMPTY
+                    vol_gate_src = vun
+                else:
+                    # CELLGROUPED-hdf5-paired sample: volume_fl is the ONLY volume signal (already
+                    # calibrated, no AU counterpart), so it fills vol_cal and is what gates apply to.
+                    vun  = _EMPTY
+                    has_cal = True
+                    vcal = pair[_PAIR_VNAT].to_numpy(dtype=float)
+                    vol_gate_src = vcal
 
                 if paired:
                     # single mask over always-present props keeps them length-matched & row-aligned;
-                    # vcal (finite wherever volume_au is) rides along under the same mask.
-                    mask = (np.isfinite(mass) & np.isfinite(dens) & np.isfinite(vun)
+                    # vcal (finite wherever vol_gate_src is) rides along under the same mask.
+                    mask = (np.isfinite(mass) & np.isfinite(dens) & np.isfinite(vol_gate_src)
                             & (mass >= bm_lo) & (mass <= bm_hi)
-                            & (vun >= ix_lo) & (vun <= ix_hi))
+                            & (vol_gate_src >= ix_lo) & (vol_gate_src <= ix_hi))
                     props = {
                         "mass":      mass[mask],
                         "density":   dens[mask],
                         "vol_cal":   vcal[mask] if has_cal else _EMPTY,
-                        "vol_uncal": vun[mask],
+                        "vol_uncal": vun[mask] if has_vun else _EMPTY,
                     }
                 else:
                     bm_mask = np.isfinite(mass) & (mass >= bm_lo) & (mass <= bm_hi)
-                    ix_mask = np.isfinite(vun) & (vun >= ix_lo) & (vun <= ix_hi)
+                    ix_mask = np.isfinite(vol_gate_src) & (vol_gate_src >= ix_lo) & (vol_gate_src <= ix_hi)
                     props = {
                         "mass":      _gate_clean(mass, bm_mask),
                         "density":   _gate_clean(dens, ix_mask),
-                        "vol_cal":   _gate_clean(vcal, ix_mask),
-                        "vol_uncal": _gate_clean(vun, ix_mask),
+                        "vol_cal":   _gate_clean(vcal, ix_mask) if has_cal else _EMPTY,
+                        "vol_uncal": _gate_clean(vun, ix_mask) if has_vun else _EMPTY,
                     }
             else:
                 # Unpaired sample (mass-only / volume-only): fall back to the standalone blocks.
@@ -449,7 +475,10 @@ def load_ifxm(compiled_dir, baseline_density=_REQUIRED, *, sample_col="sample_na
 
     For each sample (worksheet named by `sheet_col`): if it has a PAIRED ('pair_') block, mass /
     density / vol_cal / vol_uncal come from that matched subset (mass bm-gated; the others ifxm-gated
-    on the uncalibrated volume). If it has NO paired block (a mass-only or volume-only run), the
+    on whichever volume the pairing has — legacy samples gate on the uncalibrated volume_au;
+    CELLGROUPED-hdf5-paired samples have only the calibrated volume_fl, so vol_uncal is empty for
+    them and the gate applies to volume_fl instead). If it has NO paired block (a mass-only or
+    volume-only run), the
     standalone MASS ('mass_') and/or VOLUME ('vol_') blocks are used instead — `mass` from the full
     SMR distribution and/or `vol_uncal`/`vol_cal` from the full FXM distribution, with `density`
     empty (density requires pairing). Samples with no tabular iFXM data are skipped. Every metadata
@@ -467,8 +496,10 @@ def load_ifxm_paired(compiled_dir, baseline_density=_REQUIRED, *, sample_col="sa
     """Like load_ifxm, but keeps per-cell arrays row-ALIGNED across properties (one shared mask from
     the PAIRED block), so a cell's mass / density / volume stay paired. Use for scatter_by. Only
     samples with a paired block appear (unpaired mass-only / volume-only samples are skipped — there
-    is nothing to correlate); samples not calibrated get an empty `vol_cal` (scatters using it are
-    skipped, not misaligned). baseline_density is always needed here (density is always read)."""
+    is nothing to correlate); samples not calibrated (or paired via a CELLGROUPED hdf5, which has no
+    raw-AU volume at all) get an empty `vol_uncal`/`vol_cal` as appropriate (scatters using an empty
+    prop are skipped, not misaligned). baseline_density is always needed here (density is always
+    read)."""
     return _load_ifxm_records(
         compiled_dir, baseline_density, sample_col, sheet_col,
         (bm_lower_col, bm_upper_col, ifxm_lower_col, ifxm_upper_col), normalizers, paired=True)

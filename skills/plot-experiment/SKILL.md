@@ -75,6 +75,15 @@ standalone `mass_`/`vol_` blocks, so those samples still plot. `density` and `sc
 pairing, so they simply don't appear for unpaired samples — `build_plan` omits plots for absent
 properties automatically.
 
+**Two paired formats exist**, chosen automatically by `compile_experiment.py` per sample — the driver
+never needs to know which: legacy samples paired from a `*_PairedSMRVolumes.csv`/`*_ProcessedVolumes.
+csv` give `vol_uncal` (raw AU, always) and `vol_cal` (fL, only if Coulter-calibrated); current-pipeline
+samples paired straight from a `*_CELLGROUPED.hdf5` (no `*_ProcessedVolumes.csv` — current
+SMRFXMAnalysis output) give **only** `vol_cal` (already calibrated fL) with `vol_uncal` empty for
+those samples. An experiment can mix both kinds of sample; each prop is simply present or empty per
+sample as usual. If every sample in an experiment is hdf5-paired, `vol_uncal` is empty everywhere and
+`build_plan` will not propose any plots for it.
+
 **Ask the user for `baseline_density`** (g/mL) — not stored in any data file, required for absolute
 density (paired iFXM). (FL5 reference used `1.008`.) It can be omitted for a mass-only / volume-only
 experiment with no density.
@@ -149,8 +158,10 @@ are exposed for bespoke logic. (k-sigma/3-std is intentionally not built in — 
 - **`baseline_density` has no default** — needed for paired density; `load_ifxm` raises **lazily**
   (only when a paired block is read), so set it deliberately for any paired experiment. A mass-only /
   volume-only experiment can omit it.
-- **iFXM gating**: `mass` uses `bm_gate`; `density`/`vol_cal`/`vol_uncal` share one mask on the
-  *uncalibrated* volume. No statistical outlier rejection is applied by the loaders — only non-finite
+- **iFXM gating**: `mass` uses `bm_gate`; `density`/`vol_cal`/`vol_uncal` share one mask on whichever
+  volume the sample's pairing has — the *uncalibrated* volume for legacy CSV-paired samples, or the
+  *calibrated* `volume_fl` for hdf5-paired samples (which have no uncalibrated reading to gate on).
+  No statistical outlier rejection is applied by the loaders — only non-finite
   values are dropped (see the opt-in `reject_outliers` above for trimming).
   `load_ifxm` gates mass and the volume props with separate masks (so per-property arrays
   can differ in length); `load_ifxm_paired` uses one shared mask to keep arrays row-aligned — always

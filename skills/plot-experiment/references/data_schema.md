@@ -65,8 +65,15 @@ separated by one blank spacer column, distinguished by a column-name prefix:
   (fL only when calibrated).
 - `mass_*` — every SMR cell (unpaired): `mass_mass_pg` (+ any pass-through columns from the mass CSV).
 - `pair_*` — **matched cells, row-aligned per cell**: `pair_transit_index`, `pair_mass_pg`,
-  `pair_volume_au`, `pair_volume_fL` (calibrated volume, present **only** when a Coulter calibration
-  ran), `pair_buoyant_density`.
+  `pair_buoyant_density`, and volume in **one of two forms depending on how the sample was paired**
+  (never both):
+  - Legacy (CSV) pairing — `*_pairing_results/*_PairedSMRVolumes.csv` or `matched_mass` rows in a
+    `*_ProcessedVolumes.csv`: `pair_volume_au` (raw FXM units, always present), plus
+    `pair_volume_fL` (Coulter-calibrated fL, present **only** when a calibration ran).
+  - Current-pipeline (hdf5) pairing — straight from a `*_CELLGROUPED.hdf5`'s
+    `analysis/density/cells` table (current SMRFXMAnalysis output, which no longer writes a
+    `*_ProcessedVolumes.csv` at all): `pair_volume_fl` (lowercase — **already calibrated**, fL,
+    filtered to `status_code == 'ok'`). There is **no** `pair_volume_au` for these samples.
 
 Blocks are independent: a **paired run** has all three; a **mass-only run** has only `mass_*`; a
 **volume-only run** has only `vol_*`. Read a block with `sheet.filter(regex="^pair_").dropna(how="all")`
@@ -76,19 +83,21 @@ truncated in the sheet; the loaders prefer the overflow CSV when present.
 
 Derived properties, and where the loader sources each:
 
-| prop key    | paired sample (has `pair_`)             | unpaired sample (mass-only / volume-only) | gate        | units |
-|-------------|------------------------------------------|-------------------------------------------|-------------|-------|
-| `mass`      | `pair_mass_pg`                           | `mass_mass_pg` (full SMR distribution)    | `bm_gate`   | pg    |
-| `density`   | `pair_buoyant_density + baseline_density`| — (empty; density **requires pairing**)   | `ifxm_gate` | g/mL  |
-| `vol_cal`   | `pair_volume_fL` (empty if uncalibrated) | `vol_volume_fL` (empty if uncalibrated)   | `ifxm_gate` | fL    |
-| `vol_uncal` | `pair_volume_au`                         | `vol_volume_au` (full FXM distribution)   | `ifxm_gate` | AU    |
+| prop key    | paired via CSV (has `pair_volume_au`)    | paired via hdf5 (has `pair_volume_fl`)  | unpaired sample (mass-only / volume-only) | gate        | units |
+|-------------|--------------------------------------------|--------------------------------------------|---------------------------------------------|-------------|-------|
+| `mass`      | `pair_mass_pg`                              | `pair_mass_pg`                              | `mass_mass_pg` (full SMR distribution)       | `bm_gate`   | pg    |
+| `density`   | `pair_buoyant_density + baseline_density`   | `pair_buoyant_density + baseline_density`   | — (empty; density **requires pairing**)      | `ifxm_gate` | g/mL  |
+| `vol_cal`   | `pair_volume_fL` (empty if uncalibrated)    | `pair_volume_fl` (always present)           | `vol_volume_fL` (empty if uncalibrated)      | `ifxm_gate` | fL    |
+| `vol_uncal` | `pair_volume_au`                            | — (empty; no raw-AU reading for these)       | `vol_volume_au` (full FXM distribution)      | `ifxm_gate` | AU    |
 
 **Paired-primary, standalone-fallback**: when a sample has a `pair_` block, marginal `mass`/`vol_*`
 come from that matched subset (unchanged behavior); the standalone `mass_`/`vol_` blocks are used
 **only** when there is no `pair_` block. `scatter_by` (via `load_ifxm_paired`) uses the `pair_` block
 only, so unpaired samples never appear in scatters. In the paired loader the props share **one** mask
-on the uncalibrated `pair_volume_au` (row-aligned); in the distribution loader each prop is gated and
-cleaned independently.
+(row-aligned) on whichever volume the pairing has — `pair_volume_au` for CSV-paired samples,
+`pair_volume_fl` for hdf5-paired ones (there is no raw-AU signal to gate on for those, so the ifxm
+gate bounds — if any exist for such a sample — apply to the calibrated volume instead); in the
+distribution loader each prop is gated and cleaned independently.
 
 ### `baseline_density` — not in any file
 
