@@ -77,16 +77,20 @@ properties automatically.
 
 **Two paired formats exist**, chosen automatically by `compile_experiment.py` per sample — the driver
 never needs to know which: legacy samples paired from a `*_PairedSMRVolumes.csv`/`*_ProcessedVolumes.
-csv` give `vol_uncal` (raw AU, always) and `vol_cal` (fL, only if Coulter-calibrated); current-pipeline
-samples paired straight from a `*_CELLGROUPED.hdf5` (no `*_ProcessedVolumes.csv` — current
-SMRFXMAnalysis output) give **only** `vol_cal` (already calibrated fL) with `vol_uncal` empty for
-those samples. An experiment can mix both kinds of sample; each prop is simply present or empty per
-sample as usual. If every sample in an experiment is hdf5-paired, `vol_uncal` is empty everywhere and
-`build_plan` will not propose any plots for it.
+csv` give `vol_uncal` (raw AU, always), `vol_cal` (fL, only if Coulter-calibrated), and only a
+RELATIVE `pair_buoyant_density` (density = that + `baseline_density`); current-pipeline samples
+paired straight from a `*_CELLGROUPED.hdf5` (no `*_ProcessedVolumes.csv` — current SMRFXMAnalysis
+output) give **only** `vol_cal` (already calibrated fL) with `vol_uncal` empty, and an ABSOLUTE
+`pair_cell_density_g_per_mL` computed by the hdf5 pipeline itself — `density` uses that directly, no
+`baseline_density` involved. An experiment can mix both kinds of sample; each prop is simply present
+or empty per sample as usual. If every sample in an experiment is hdf5-paired, `vol_uncal` is empty
+everywhere and `build_plan` will not propose any plots for it.
 
-**Ask the user for `baseline_density`** (g/mL) — not stored in any data file, required for absolute
-density (paired iFXM). (FL5 reference used `1.008`.) It can be omitted for a mass-only / volume-only
-experiment with no density.
+**Ask the user for `baseline_density`** (g/mL) — not stored in any data file — **only if the
+experiment has a legacy CSV-paired sample** (relative `pair_buoyant_density` only); it is required
+lazily, so the loaders raise only when such a sample's density is actually read. (FL5 reference used
+`1.008`.) It can be omitted for a mass-only / volume-only experiment, or one made up entirely of
+CELLGROUPED-hdf5-paired samples (they already carry an absolute density).
 
 ### 3. Generate the driver
 1. Create the analysis output dir. Into it, **copy**
@@ -155,9 +159,11 @@ each sample dropped. Low-level keep-masks (`tk.outlier_mask`, `keep_mad`/`keep_i
 are exposed for bespoke logic. (k-sigma/3-std is intentionally not built in — ask if the user wants it.)
 
 ## Gotchas
-- **`baseline_density` has no default** — needed for paired density; `load_ifxm` raises **lazily**
-  (only when a paired block is read), so set it deliberately for any paired experiment. A mass-only /
-  volume-only experiment can omit it.
+- **`baseline_density` has no default** — needed only for a legacy CSV-paired sample's density
+  (relative `pair_buoyant_density` + baseline); `load_ifxm` raises **lazily** (only when such a
+  block is actually read), so set it deliberately for any experiment with a legacy-paired sample. A
+  mass-only / volume-only experiment, or one made up only of CELLGROUPED-hdf5-paired samples
+  (`pair_cell_density_g_per_mL`, already absolute), can omit it.
 - **iFXM gating**: `mass` uses `bm_gate`; `density`/`vol_cal`/`vol_uncal` share one mask on whichever
   volume the sample's pairing has — the *uncalibrated* volume for legacy CSV-paired samples, or the
   *calibrated* `volume_fl` for hdf5-paired samples (which have no uncalibrated reading to gate on).

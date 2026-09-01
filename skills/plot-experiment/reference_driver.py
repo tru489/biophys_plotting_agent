@@ -38,7 +38,10 @@ PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_figures.pptx"
 
 # Fluid baseline (g/mL) added to measured buoyant density to get absolute density. NOT stored in any
 # data file; varies between experiments — set it deliberately. (FL5 reference used 1.008.) Needed
-# only for paired iFXM density; a mass-only / volume-only experiment can leave it as-is (unused).
+# only for a sample paired from a legacy PairedSMRVolumes/ProcessedVolumes CSV (relative
+# buoyant_density only); a sample paired straight from a CELLGROUPED hdf5 already carries an
+# absolute density and ignores this. A mass-only / volume-only experiment, or one made up entirely
+# of hdf5-paired samples, can leave it as-is (unused).
 # Paired runs use the matched pair_ block; mass-only / volume-only runs fall back to the standalone
 # mass_/vol_ blocks automatically, so they plot too (density/scatter need pairing and are skipped).
 BASELINE_DENSITY = 1.008
