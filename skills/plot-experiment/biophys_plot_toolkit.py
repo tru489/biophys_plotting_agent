@@ -867,20 +867,20 @@ def value_label(col, value, roles=None, records=None) -> str:
 
 
 def _detail_label(r, roles, time_col) -> str:
-    """Per-sample row/box label inside a single group: time (if any) + rep, else the sample name."""
+    """Per-sample row/box label inside a single group: time (if any) + sample name."""
     parts = []
     if time_col is not None and rget(r, time_col) is not None:
         parts.append(value_label(time_col, rget(r, time_col), roles))
-    parts.append(rget(r, "rep"))
-    return " ".join(p for p in parts if p) or r["sample"]
+    parts.append(r["sample"])
+    return " ".join(p for p in parts if p)
 
 
 def _compare_label(r, group_col, roles, time_col) -> str:
-    """Per-sample label in a cross-group comparison: group value + time + rep."""
+    """Per-sample label in a cross-group comparison: group value + time + sample name."""
     parts = [str(rget(r, group_col))]
     if time_col is not None and rget(r, time_col) is not None:
         parts.append(value_label(time_col, rget(r, time_col), roles))
-    parts.append(rget(r, "rep"))
+    parts.append(r["sample"])
     return " ".join(p for p in parts if p)
 
 
