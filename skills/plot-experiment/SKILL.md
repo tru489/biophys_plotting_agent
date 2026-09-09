@@ -67,37 +67,27 @@ Behavior to convey: **every** boolean/categorical/approved-ordered column become
 axis (no cardinality cap — everything is plotted; reorganize on a later pass). Multiple columns are
 handled **independently** by default; cross-products are available on request via `cross_groups`. A
 time column orders samples sequentially and drives timecourses. Gate columns still apply; missing
-gate → no cutoff; uncalibrated samples get an empty `vol_cal`.
+gate → no cutoff; unpaired samples without a volume reading get an empty `vol`.
 
 **Unpaired runs are supported.** A paired sample uses its matched `pair_` block (unchanged); a
-**mass-only** run (`mass` only) or **volume-only** run (`vol_uncal`/`vol_cal` only) falls back to the
-standalone `mass_`/`vol_` blocks, so those samples still plot. `density` and `scatter_by` need
-pairing, so they simply don't appear for unpaired samples — `build_plan` omits plots for absent
-properties automatically.
+**mass-only** run (`mass` only) or **volume-only** run (`vol` only) falls back to the standalone
+`mass_`/`vol_` blocks, so those samples still plot. `density` and `scatter_by` need pairing, so they
+simply don't appear for unpaired samples — `build_plan` omits plots for absent properties
+automatically.
 
-**Two paired formats exist**, chosen automatically by `compile_experiment.py` per sample — the driver
-never needs to know which: legacy samples paired from a `*_PairedSMRVolumes.csv`/`*_ProcessedVolumes.
-csv` give `vol_uncal` (raw AU, always), `vol_cal` (fL, only if Coulter-calibrated), and only a
-RELATIVE `pair_buoyant_density` (density = that + `baseline_density`); current-pipeline samples
-paired straight from a `*_CELLGROUPED.hdf5` (no `*_ProcessedVolumes.csv` — current SMRFXMAnalysis
-output) give **only** `vol_cal` (already calibrated fL) with `vol_uncal` empty, and an ABSOLUTE
-`pair_cell_density_g_per_mL` computed by the hdf5 pipeline itself — `density` uses that directly, no
-`baseline_density` involved. An experiment can mix both kinds of sample; each prop is simply present
-or empty per sample as usual. If every sample in an experiment is hdf5-paired, `vol_uncal` is empty
-everywhere and `build_plan` will not propose any plots for it.
-
-**Ask the user for `baseline_density`** (g/mL) — not stored in any data file — **only if the
-experiment has a legacy CSV-paired sample** (relative `pair_buoyant_density` only); it is required
-lazily, so the loaders raise only when such a sample's density is actually read. (FL5 reference used
-`1.008`.) It can be omitted for a mass-only / volume-only experiment, or one made up entirely of
-CELLGROUPED-hdf5-paired samples (they already carry an absolute density).
+**There is exactly one paired format** — straight from a `*_CELLGROUPED.hdf5`'s
+`analysis/density/cells` table (current SMRFXMAnalysis output). Every paired sample carries all
+three: `pair_mass_pg` (pg), `pair_volume_fl` (already-calibrated fL), and
+`pair_cell_density_g_per_mL` (ABSOLUTE density, computed by the hdf5 pipeline itself from its own
+`media_density_g_per_mL` — no baseline to supply). A pair_ block missing any of the three raises
+loudly rather than silently falling back.
 
 ### 3. Generate the driver
 1. Create the analysis output dir. Into it, **copy**
    `${CLAUDE_PLUGIN_ROOT}/skills/plot-experiment/biophys_plot_toolkit.py` (keeps each analysis
    self-contained, git-committable, reproducible independent of the plugin install).
 2. Adapt `reference_driver.py` into that dir: set `EXP_NAME`, `COMPILED_DIR` (iFXM) and/or
-   `COULTER_DIR` (Coulter, `None` if absent), `FIG_DIR`, `PPTX_OUT`, `BASELINE_DENSITY`, and set
+   `COULTER_DIR` (Coulter, `None` if absent), `FIG_DIR`, `PPTX_OUT`, and set
    `ROLE_OVERRIDES` to the choices the user made in step 2 (resolving every `[CONFIRM]`). The
    template's default path is `infer_roles → build_plan → render_plan(print) → autoplot`; keep it
    for the standard grid, or drive the **explicit combinators** for full control:
@@ -137,8 +127,8 @@ call cleans every downstream plot.
 tails", "reject outliers on volume"), do **not** guess — present a menu with `AskUserQuestion`
 enumerating the full spec, then wire the answer into the driver. Ask for:
 
-1. **Which properties** to clean — any of coulter `volume`; iFXM `mass` / `density` / `vol_cal` /
-   `vol_uncal` (multi-select; can differ per property).
+1. **Which properties** to clean — any of coulter `volume`; iFXM `mass` / `density` / `vol`
+   (multi-select; can differ per property).
 2. **Method** (per property allowed): `mad` (modified z-score, robust — best for density),
    `iqr` (Tukey fences, robust, matches the box whiskers), `percentile` (fixed-fraction tail clip).
 3. **Scope**: `per_sample` (each sample trimmed on its own stats — default) or `pooled` (one
@@ -159,19 +149,15 @@ each sample dropped. Low-level keep-masks (`tk.outlier_mask`, `keep_mad`/`keep_i
 are exposed for bespoke logic. (k-sigma/3-std is intentionally not built in — ask if the user wants it.)
 
 ## Gotchas
-- **`baseline_density` has no default** — needed only for a legacy CSV-paired sample's density
-  (relative `pair_buoyant_density` + baseline); `load_ifxm` raises **lazily** (only when such a
-  block is actually read), so set it deliberately for any experiment with a legacy-paired sample. A
-  mass-only / volume-only experiment, or one made up only of CELLGROUPED-hdf5-paired samples
-  (`pair_cell_density_g_per_mL`, already absolute), can omit it.
-- **iFXM gating**: `mass` uses `bm_gate`; `density`/`vol_cal`/`vol_uncal` share one mask on whichever
-  volume the sample's pairing has — the *uncalibrated* volume for legacy CSV-paired samples, or the
-  *calibrated* `volume_fl` for hdf5-paired samples (which have no uncalibrated reading to gate on).
-  No statistical outlier rejection is applied by the loaders — only non-finite
-  values are dropped (see the opt-in `reject_outliers` above for trimming).
-  `load_ifxm` gates mass and the volume props with separate masks (so per-property arrays
-  can differ in length); `load_ifxm_paired` uses one shared mask to keep arrays row-aligned — always
-  use it for `scatter_by` (and pass `paired_records=` to `autoplot`), or a scatter's x/y won't pair.
+- **iFXM gating**: `mass` uses `bm_gate`; `density`/`vol` share one mask on `pair_volume_fl` (the
+  paired sample's volume). No statistical outlier rejection is applied by the loaders — only
+  non-finite values are dropped (see the opt-in `reject_outliers` above for trimming). `load_ifxm`
+  gates mass and the volume props with separate masks (so per-property arrays can differ in
+  length); `load_ifxm_paired` uses one shared mask to keep arrays row-aligned — always use it for
+  `scatter_by` (and pass `paired_records=` to `autoplot`), or a scatter's x/y won't pair.
+- **A pair_ block must carry all three columns** — `pair_mass_pg`, `pair_volume_fl`,
+  `pair_cell_density_g_per_mL`. `load_ifxm`/`load_ifxm_paired` raise a clear error naming the
+  sample if any are missing, rather than silently dropping data. This is the only paired format.
 - **Roles are inferred, not fixed** — `condition`/`time_h`/`drug_name` are just the *reference*
   column names; any hand-added column works. If a numeric column is misread (gradient vs category),
   fix it with `ROLE_OVERRIDES`/`overrides=`, not by renaming data.

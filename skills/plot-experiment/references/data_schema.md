@@ -64,23 +64,17 @@ separated by one blank spacer column, distinguished by a column-name prefix:
 - `vol_*` — every FXM cell (unpaired): `vol_transit_index`, `vol_volume_au`, `vol_volume_fL`
   (fL only when calibrated).
 - `mass_*` — every SMR cell (unpaired): `mass_mass_pg` (+ any pass-through columns from the mass CSV).
-- `pair_*` — **matched cells, row-aligned per cell**: `pair_mass_pg`, and the rest depends on
-  **which of two sources paired the sample** (never both):
-  - Legacy (CSV) pairing — `*_pairing_results/*_PairedSMRVolumes.csv` or `matched_mass` rows in a
-    `*_ProcessedVolumes.csv`: `pair_transit_index`, `pair_volume_au` (raw FXM units, always
-    present), `pair_volume_fL` (Coulter-calibrated fL, present **only** when a calibration ran),
-    and only a **RELATIVE** `pair_buoyant_density`.
-  - Current-pipeline (hdf5) pairing — straight from a `*_CELLGROUPED.hdf5`'s
-    `analysis/density/cells` table (current SMRFXMAnalysis output, which no longer writes a
-    `*_ProcessedVolumes.csv` at all), filtered to `status_code == 'ok'` and mirrored essentially
-    verbatim rather than curated to a few columns: `pair_cell_id` (not `pair_transit_index`),
-    `pair_volume_fl` (lowercase — **already calibrated**, fL; there is **no** `pair_volume_au` for
-    these samples), `pair_buoyant_density` (still relative), and **`pair_cell_density_g_per_mL`**
-    — the **ABSOLUTE** density, computed by the hdf5 pipeline itself from its own
-    `media_density_g_per_mL` — plus confidence/QC columns (`pair_mass_confidence_score`,
-    `pair_volume_confidence`, `pair_density_confidence`, `pair_qc_fail_mask`, `pair_qc_warn_mask`,
-    `pair_status_code`, `pair_status_text`, `pair_mass_cell_index`, `pair_volume_cell_index`,
-    `pair_matched_peak_index`).
+- `pair_*` — **matched cells, row-aligned per cell**, straight from a `*_CELLGROUPED.hdf5`'s
+  `analysis/density/cells` table (current SMRFXMAnalysis output; the only paired format), filtered
+  to `status_code == 'ok'` and mirrored essentially verbatim: `pair_cell_id`, `pair_mass_pg` (pg),
+  `pair_volume_fl` (lowercase — already-calibrated fL), and **`pair_cell_density_g_per_mL`** — the
+  **ABSOLUTE** density, computed by the hdf5 pipeline itself from its own `media_density_g_per_mL`
+  — plus confidence/QC columns (`pair_mass_confidence_score`, `pair_volume_confidence`,
+  `pair_density_confidence`, `pair_qc_fail_mask`, `pair_qc_warn_mask`, `pair_status_code`,
+  `pair_status_text`, `pair_mass_cell_index`, `pair_volume_cell_index`, `pair_matched_peak_index`,
+  `pair_media_density_g_per_mL`, `pair_buoyant_density`). The loader requires `pair_mass_pg`,
+  `pair_volume_fl`, and `pair_cell_density_g_per_mL` to be present whenever a `pair_` block exists
+  at all — it raises a clear error naming the sample if any are missing, rather than falling back.
 
 Blocks are independent: a **paired run** has all three; a **mass-only run** has only `mass_*`; a
 **volume-only run** has only `vol_*`. Read a block with `sheet.filter(regex="^pair_").dropna(how="all")`
@@ -90,34 +84,24 @@ truncated in the sheet; the loaders prefer the overflow CSV when present.
 
 Derived properties, and where the loader sources each:
 
-| prop key    | paired via CSV (has `pair_volume_au`)    | paired via hdf5 (has `pair_volume_fl`)  | unpaired sample (mass-only / volume-only) | gate        | units |
-|-------------|--------------------------------------------|--------------------------------------------|---------------------------------------------|-------------|-------|
-| `mass`      | `pair_mass_pg`                              | `pair_mass_pg`                              | `mass_mass_pg` (full SMR distribution)       | `bm_gate`   | pg    |
-| `density`   | `pair_buoyant_density + baseline_density`   | `pair_cell_density_g_per_mL` (already absolute — no baseline_density) | — (empty; density **requires pairing**) | `ifxm_gate` | g/mL  |
-| `vol_cal`   | `pair_volume_fL` (empty if uncalibrated)    | `pair_volume_fl` (always present)           | `vol_volume_fL` (empty if uncalibrated)      | `ifxm_gate` | fL    |
-| `vol_uncal` | `pair_volume_au`                            | — (empty; no raw-AU reading for these)       | `vol_volume_au` (full FXM distribution)      | `ifxm_gate` | AU    |
+| prop key  | paired sample                                | unpaired sample (mass-only / volume-only)                          | gate        | units |
+|-----------|-----------------------------------------------|----------------------------------------------------------------------|-------------|-------|
+| `mass`    | `pair_mass_pg`                                 | `mass_mass_pg` (full SMR distribution)                                | `bm_gate`   | pg    |
+| `density` | `pair_cell_density_g_per_mL` (already absolute) | — (empty; density **requires pairing**)                              | `ifxm_gate` | g/mL  |
+| `vol`     | `pair_volume_fl` (always present)              | `vol_volume_fL` if calibrated, else `vol_volume_au` (full FXM distribution) | `ifxm_gate` | fL (or AU if uncalibrated) |
 
-**Paired-primary, standalone-fallback**: when a sample has a `pair_` block, marginal `mass`/`vol_*`
+**Paired-primary, standalone-fallback**: when a sample has a `pair_` block, marginal `mass`/`vol`
 come from that matched subset (unchanged behavior); the standalone `mass_`/`vol_` blocks are used
-**only** when there is no `pair_` block. `scatter_by` (via `load_ifxm_paired`) uses the `pair_` block
-only, so unpaired samples never appear in scatters. In the paired loader the props share **one** mask
-(row-aligned) on whichever volume the pairing has — `pair_volume_au` for CSV-paired samples,
-`pair_volume_fl` for hdf5-paired ones (there is no raw-AU signal to gate on for those, so the ifxm
-gate bounds — if any exist for such a sample — apply to the calibrated volume instead); in the
-distribution loader each prop is gated and cleaned independently.
+**only** when there is no `pair_` block at all. `scatter_by` (via `load_ifxm_paired`) uses the
+`pair_` block only, so unpaired samples never appear in scatters. In the paired loader the props
+share **one** mask (row-aligned) on `pair_volume_fl`; in the distribution loader (`load_ifxm`) each
+prop is gated and cleaned independently.
 
-### `baseline_density` — not in any file (only needed for legacy CSV-paired samples)
+### Density is always absolute — no baseline to supply
 
-For a **legacy CSV-paired** sample: `density = buoyant_density + baseline_density`.
-`buoyant_density` (`pair_buoyant_density`) is **RELATIVE**; the baseline (g/mL) is
-**experiment-specific and stored nowhere in the data**. `load_ifxm` requires it **lazily** — only
-when such a block's density is actually read — so a mass-only / volume-only experiment (no
-density), or one made up only of **hdf5-paired** samples, can omit it. The skill asks the user for
-the value per experiment. The FL5 reference experiments used `1.008`.
-
-For an **hdf5-paired** sample, `density` is `pair_cell_density_g_per_mL` directly — already
-absolute, computed by the hdf5 pipeline itself from its own `media_density_g_per_mL` — so
-`baseline_density` plays no role at all for that sample.
+`density` is `pair_cell_density_g_per_mL` directly — already absolute, computed by the hdf5
+pipeline itself from its own `media_density_g_per_mL`. There is no relative-density fallback and
+nothing for the driver or the skill to ask the user for.
 
 ## Annotation columns are arbitrary — roles are inferred, not fixed
 
@@ -156,7 +140,7 @@ Loaders no longer take per-role column args (role assignment is downstream). The
 | loader | args |
 |--------|------|
 | `load_coulter(coulter_dir, …)` | `sample_col="sample_name"`, `data_file=None` (override data-CSV auto-locate), `normalizers=VALUE_NORMALIZERS` |
-| `load_ifxm` / `load_ifxm_paired(compiled_dir, baseline_density, …)` | `sample_col`, `sheet_col="sheet_name"` (falls back to sample), `bm_lower_col`/`bm_upper_col`/`ifxm_lower_col`/`ifxm_upper_col`, `normalizers` |
+| `load_ifxm` / `load_ifxm_paired(compiled_dir, …)` | `sample_col`, `sheet_col="sheet_name"` (falls back to sample), `bm_lower_col`/`bm_upper_col`/`ifxm_lower_col`/`ifxm_upper_col`, `normalizers` |
 
 Grouping/ordering columns are chosen at plot time by passing `group_col=` / `series_col=` /
 `facet_col=` / `time_col=` (or letting `build_plan` pick them from the inferred roles). Missing gate
@@ -176,6 +160,6 @@ Figures go to `<exp>_fig/`; the deck to `<exp>_figures.pptx`. File names:
 ```
 
 - `datatype` ∈ {`coulter`, `ifxm`}
-- `prop` ∈ {`volume`} (coulter) / {`mass`, `density`, `vol_cal`, `vol_uncal`} (ifxm)
+- `prop` ∈ {`volume`} (coulter) / {`mass`, `density`, `vol`} (ifxm)
 - `col` / `value` are whatever grouping column and value were used (`is_activated=yes`, `media=rpmi`, …)
 - `slug(value)` lowercases and replaces non-alphanumerics with `-`

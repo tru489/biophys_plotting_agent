@@ -53,8 +53,8 @@ See [skills/plot-experiment/references/data_schema.md](skills/plot-experiment/re
 for the full schema. Conditions, drugs, and time points are hand-annotated columns and vary per
 experiment; the skill reads them from the metadata rather than assuming a fixed set.
 
-> **Note:** absolute density needs a per-experiment `baseline_density` (g/mL) that is *not* stored
-> in any data file. The skill asks for it; there is no silent default.
+> **Note:** density is always absolute (`pair_cell_density_g_per_mL`, computed by the hdf5 pipeline
+> itself) — there is no baseline to supply.
 
 ## Layout
 

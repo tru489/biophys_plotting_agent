@@ -4,7 +4,7 @@ Reference plotting driver for a compiled/annotated biophysics experiment.
 This is the TEMPLATE the plot-experiment skill adapts per experiment. When generating a driver:
   - copy biophys_plot_toolkit.py next to this driver in the analysis directory (so the import
     below resolves locally and the analysis stays self-contained / reproducible),
-  - set COMPILED_DIR / COULTER_DIR, FIG_DIR and BASELINE_DENSITY for this experiment,
+  - set COMPILED_DIR / COULTER_DIR and FIG_DIR for this experiment,
   - review the printed plan and set ROLE_OVERRIDES for any [CONFIRM] columns.
 
 The toolkit reads whatever hand-added annotation columns exist and classifies each into a role
@@ -36,25 +36,20 @@ OUT_ROOT = COMPILED_DIR.parent if COMPILED_DIR else COULTER_DIR.parent
 FIG_DIR  = OUT_ROOT / f"{EXP_NAME}_fig"
 PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_figures.pptx"
 
-# Fluid baseline (g/mL) added to measured buoyant density to get absolute density. NOT stored in any
-# data file; varies between experiments — set it deliberately. (FL5 reference used 1.008.) Needed
-# only for a sample paired from a legacy PairedSMRVolumes/ProcessedVolumes CSV (relative
-# buoyant_density only); a sample paired straight from a CELLGROUPED hdf5 already carries an
-# absolute density and ignores this. A mass-only / volume-only experiment, or one made up entirely
-# of hdf5-paired samples, can leave it as-is (unused).
-# Paired runs use the matched pair_ block; mass-only / volume-only runs fall back to the standalone
-# mass_/vol_ blocks automatically, so they plot too (density/scatter need pairing and are skipped).
-BASELINE_DENSITY = 1.008
+# Paired runs use the matched pair_ block (pair_mass_pg, pair_volume_fl, pair_cell_density_g_per_mL
+# — density is already absolute, computed by the hdf5 pipeline itself); mass-only / volume-only
+# runs fall back to the standalone mass_/vol_ blocks automatically, so they plot too (density and
+# scatter need pairing and are skipped for those samples).
 
 # Axis labels for each property (also selects which props to plot). Trim to what exists.
-IFXM_LABELS    = dict(tk.IFXM_PROPS)        # mass / density / vol_cal / vol_uncal
+IFXM_LABELS    = dict(tk.IFXM_PROPS)        # mass / density / vol
 COULTER_LABELS = dict(tk.COULTER_PROPS)     # volume
 
 # 2-D per-cell scatters with marginal histograms (iFXM only). (prop_x, prop_y, xlabel, ylabel)
 SCATTER_PAIRS = [
-    ("mass",    "density", "Buoyant mass (pg)",      "Total density (g/cm^3)"),
-    ("vol_cal", "mass",    "Calibrated volume (fL)", "Buoyant mass (pg)"),
-    ("vol_cal", "density", "Calibrated volume (fL)", "Total density (g/cm^3)"),
+    ("mass", "density", "Buoyant mass (pg)", "Total density (g/cm^3)"),
+    ("vol",  "mass",    "Volume (fL)",       "Buoyant mass (pg)"),
+    ("vol",  "density", "Volume (fL)",       "Total density (g/cm^3)"),
 ]
 
 # Pin any column's role after reviewing the printed plan (resolves every [CONFIRM] flag).
@@ -67,9 +62,9 @@ def main() -> None:
     coulter = tk.load_coulter(COULTER_DIR) if COULTER_DIR else []
     ifxm = ifxm_paired = []
     if COMPILED_DIR:
-        ifxm = tk.load_ifxm(COMPILED_DIR, baseline_density=BASELINE_DENSITY)
+        ifxm = tk.load_ifxm(COMPILED_DIR)
         # row-aligned variant for scatter (keeps a cell's props paired under one shared gate mask)
-        ifxm_paired = tk.load_ifxm_paired(COMPILED_DIR, baseline_density=BASELINE_DENSITY)
+        ifxm_paired = tk.load_ifxm_paired(COMPILED_DIR)
     print(f"  coulter samples: {len(coulter)} | ifxm samples: {len(ifxm)}")
 
     # --- OPTIONAL outlier rejection (OFF by default; data is loaded verbatim otherwise) ----
