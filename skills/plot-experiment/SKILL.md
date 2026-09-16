@@ -102,6 +102,25 @@ loudly rather than silently falling back.
    Keep `import biophys_plot_toolkit as tk` — do **not** inline helpers. No statistical outlier
    rejection is applied; tame a heavy tail with axis limits in the driver.
 
+**Axis-label convention (default, automatic — general principle, not just this dataset):**
+never repeat on a per-sample tick something the figure already states via its title or its bold
+group separators. Every box plot's per-sample x-tick shows only the annotation columns *not*
+otherwise conveyed elsewhere on that same figure, not the raw `sample_name`. Concretely, in
+`plot_grouped`/`compare_groups`/`cross_groups`:
+   - `plot_grouped(group_col=…)`: the title already fixes `group_col`, and (when a time column
+     exists) the bold separators below the axis already show time — so each tick shows only the
+     *other* remaining annotation column(s).
+   - `compare_groups(group_col=…)`: the bold separators already show `group_col`'s value — so
+     each tick shows time plus every other remaining column, but not `group_col` again.
+   - `cross_groups(cols=(a, b))`: the bold separators already show the joined `a | b` key — so
+     each tick shows only whatever's left over (typically just time), not `a` or `b` again.
+   This is implemented once, generically, in `biophys_plot_toolkit.py` (`_leftover_label`, wired
+   into the box-plot path of all three combinators via each function's `roles` dict — it has no
+   per-experiment hardcoding). Ridge plots and pooled (`agg="pool"`) comparisons are intentionally
+   left showing their existing fuller/group-only labels. Apply this same "don't restate what's
+   already on the plot" principle to any new combinator or hand-rolled plotting code you add here
+   — it isn't specific to time/osm/drug columns, it's a general labeling rule for every axis.
+
 ### 4. Run it
 Ensure the deps are available (numpy, pandas, matplotlib, openpyxl, python-pptx, Pillow).
 A conda env spec is bundled at `${CLAUDE_PLUGIN_ROOT}/environment.yaml`
@@ -113,8 +132,10 @@ Run the driver. It writes PNGs to `<exp>_fig/` (see the naming grid in `data_sch
 ### 5. Show & hand off
 Surface the generated figures and the driver path. Tell the user they can fine-tune the driver
 directly in Claude Code (`ROLE_OVERRIDES`, which columns to group/compare/cross, palettes via
-`COND_COLORS`/`DRUG_COLORS`/`BOOL_COLORS`, ridge bins/overlap, scatter pairs, figure sizes) and
-re-run — the copied toolkit makes it fully editable.
+`COND_COLORS`/`DRUG_COLORS`/`BOOL_COLORS`, ridge bins/overlap, scatter pairs, figure sizes, and
+box-tick labeling via `compare_groups`/`cross_groups`'s `label_exclude=` if the automatic
+"don't restate the title/bold-separator" rule above needs a different set excluded for some
+column) and re-run — the copied toolkit makes it fully editable.
 
 ## Outlier rejection (opt-in — the loaders never trim data)
 
@@ -170,3 +191,6 @@ are exposed for bespoke logic. (k-sigma/3-std is intentionally not built in — 
   the loaders resolve sheets via the metadata `sheet_name` column automatically.
 - `images.h5` (raw `h5py` BF image stacks, alongside `experiment_data.xlsx`) is **not** used by
   these plots.
+- **Box-plot tick labels are auto-trimmed to leftover info only** (see the axis-label convention
+  in step 3) — if a customized/hand-rolled box plot looks like it's duplicating its own title or
+  bold separators on every tick, that's a bug to fix the same way, not a one-off label edit.

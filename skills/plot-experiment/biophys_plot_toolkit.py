@@ -818,6 +818,23 @@ def _compare_label(r, group_col, roles, time_col) -> str:
     return " ".join(p for p in parts if p)
 
 
+def _leftover_label(r, roles, exclude) -> str:
+    """Box-tick label holding only the annotation info NOT already conveyed elsewhere on the
+    figure (the fixed title value, and/or the bold group separators) -- i.e. every remaining
+    boolean/categorical/ordered/time column, in metadata-sheet order, joined as 'a | b'. Falls
+    back to the sample name if every column got excluded. General principle: never repeat on an
+    axis tick what the title or a bold separator already says."""
+    parts = []
+    for col, info in roles.items():
+        if col in exclude or info["role"] in ("structural", "label"):
+            continue
+        v = rget(r, col)
+        if v is None:
+            continue
+        parts.append(value_label(col, v, roles))
+    return " | ".join(parts) if parts else r["sample"]
+
+
 # ---------------------------------------------------------------------------
 # Low-level primitives (operate on a passed-in ax; no semantics)
 # ---------------------------------------------------------------------------
@@ -992,18 +1009,25 @@ def plot_grouped(records, prop, ylabel, datatype, fig_dir, *, group_col, roles=N
             _save(fig, f"{datatype}_{prop}_ridge_{tag}.png", fig_dir)
         if "box" in kinds:
             times = [rget(r, time_col) for r in sub] if time_col else None
+            # time is already conveyed by the bold time separators below the axis, so the
+            # per-box tick only needs whatever annotation columns are still unaccounted for.
+            box_exclude = {group_col, time_col} if time_col else {group_col}
+            box_labels = [_leftover_label(r, roles, box_exclude) for r in sub]
             fig, ax = plt.subplots(figsize=(max(5, len(sub) * 0.9), 5))
-            draw_boxes(ax, arrays, labels, [col] * len(sub), ylabel,
+            draw_boxes(ax, arrays, box_labels, [col] * len(sub), ylabel,
                        sep_keys=times, sep_label_fn=_time_label if times else None)
             ax.set_title(title)
             _save(fig, f"{datatype}_{prop}_box_{tag}.png", fig_dir)
 
 
 def compare_groups(records, prop, ylabel, datatype, fig_dir, *, group_col, roles=None,
-                   kinds=("box", "ridge"), agg="per_sample", colors=None, time_col=None) -> None:
+                   kinds=("box", "ridge"), agg="per_sample", colors=None, time_col=None,
+                   label_exclude=None) -> None:
     """COMPARISON across the values of `group_col`. agg='per_sample' (default) draws one box/ridge
     row per sample, colored by its group value and separated by group; agg='pool' pools all cells
     per group value into a single box/ridge row. Both a box and a ridge are produced by default.
+    `label_exclude`: extra annotation columns to leave out of the per-box tick label beyond
+    `group_col` itself (used by cross_groups, whose synthetic group_col already encodes them).
     Files: {datatype}_{prop}_{kind}_by_{group_col}.png"""
     recs = _with_prop(records, prop)
     if not recs:
@@ -1026,10 +1050,15 @@ def compare_groups(records, prop, ylabel, datatype, fig_dir, *, group_col, roles
             cols.append(colors.get(v, FALLBACK_COLOR))
         sep_keys = None
         handles = None
+        box_labels = labels
     else:  # per_sample
         sub = sort_records(recs, [c for c in (group_col, time_col, "rep") if c], roles)
         arrays = [r["props"][prop] for r in sub]
         labels = [_compare_label(r, group_col, roles, time_col) for r in sub]
+        # group_col's value is already the bold separator below the axis, so the per-box
+        # tick only needs whatever annotation columns are still unaccounted for.
+        box_exclude = {group_col, *(label_exclude or ())}
+        box_labels = [_leftover_label(r, roles, box_exclude) for r in sub]
         cols = [colors.get(rget(r, group_col), FALLBACK_COLOR) for r in sub]
         sep_keys = [rget(r, group_col) for r in sub]
         handles = [Patch(facecolor=colors.get(v, FALLBACK_COLOR),
@@ -1040,7 +1069,7 @@ def compare_groups(records, prop, ylabel, datatype, fig_dir, *, group_col, roles
     title = f"{datatype} {prop} — by {group_col}"
     if "box" in kinds:
         fig, ax = plt.subplots(figsize=(max(5, len(arrays) * 0.9), 5))
-        draw_boxes(ax, arrays, labels, cols, ylabel,
+        draw_boxes(ax, arrays, box_labels, cols, ylabel,
                    sep_keys=sep_keys, sep_label_fn=(lambda v: str(v)) if sep_keys else None)
         if handles:
             ax.legend(handles=handles, frameon=False, fontsize=8)
@@ -1192,7 +1221,7 @@ def cross_groups(records, prop, ylabel, datatype, fig_dir, *, cols, roles=None,
         rr["meta"][cross_col] = key
         tagged.append(rr)
     compare_groups(tagged, prop, ylabel, datatype, fig_dir, group_col=cross_col, roles=roles,
-                   kinds=kinds, agg="per_sample", colors=colors)
+                   kinds=kinds, agg="per_sample", colors=colors, label_exclude=set(cols))
 
 
 # ---------------------------------------------------------------------------
