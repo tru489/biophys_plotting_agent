@@ -41,6 +41,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from matplotlib.backends.backend_agg import RendererAgg
+from matplotlib.colors import to_rgb
 from matplotlib.patches import Patch
 from matplotlib.transforms import blended_transform_factory
 from pathlib import Path
@@ -836,6 +838,114 @@ def _leftover_label(r, roles, exclude) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Legend placement — a legend never sits on top of plotted data
+# ---------------------------------------------------------------------------
+# Inside-the-axes anchor points, tried in this order (conventional spots first). If every one of
+# them lands on something, the legend goes just outside the axes on the right.
+_LEGEND_INSIDE_LOCS = ("upper right", "upper left", "lower right", "lower left", "center right",
+                       "center left", "upper center", "lower center", "center")
+_LEGEND_OUTSIDE = ("center left", (1.0, 0.5))    # (loc, anchor in axes fractions)
+_INK_TOL = 8            # per-channel distance from the background that counts as "something drawn"
+_LEGEND_PAD_PX = 2      # clearance kept around the legend box
+
+
+def _ink_mask(ax, leg, renderer) -> np.ndarray:
+    """Boolean image (row 0 = top) of every pixel that differs from the empty background — lines,
+    boxes, fills, scatter points, separators — rendered with `leg` hidden. Uses the axes facecolor
+    inside the axes and the figure facecolor elsewhere."""
+    fig = ax.figure
+    was_visible = leg.get_visible()
+    leg.set_visible(False)
+    try:
+        fig.draw(renderer)
+    finally:
+        leg.set_visible(was_visible)
+    img = np.asarray(renderer.buffer_rgba(), dtype=np.int16)[..., :3]
+
+    def differs(color):
+        return (np.abs(img - np.array(to_rgb(color)) * 255).max(axis=-1) > _INK_TOL)
+
+    ink = differs(fig.get_facecolor())
+    if ax.patch.get_visible():
+        h = img.shape[0]
+        bb = ax.bbox
+        y0, y1 = int(np.floor(h - bb.y1)), int(np.ceil(h - bb.y0))
+        x0, x1 = int(np.floor(bb.x0)), int(np.ceil(bb.x1))
+        ink[max(y0, 0):y1, max(x0, 0):x1] = differs(ax.get_facecolor())[max(y0, 0):y1,
+                                                                        max(x0, 0):x1]
+    return ink
+
+
+def _legend_ink(leg, ink, renderer) -> int:
+    """How many drawn-feature pixels fall inside the legend's box (plus a small margin)."""
+    bb = leg.get_window_extent(renderer)
+    h, w = ink.shape
+    pad = _LEGEND_PAD_PX
+    x0, x1 = max(int(np.floor(bb.x0)) - pad, 0), min(int(np.ceil(bb.x1)) + pad, w)
+    y0, y1 = max(int(np.floor(h - bb.y1)) - pad, 0), min(int(np.ceil(h - bb.y0)) + pad, h)
+    return int(ink[y0:y1, x0:x1].sum()) if x1 > x0 and y1 > y0 else 0
+
+
+def _move_legend(ax, leg, loc, anchor=None) -> None:
+    leg.set_loc(loc)
+    if anchor:
+        leg.set_bbox_to_anchor(anchor, transform=ax.transAxes)
+    else:
+        leg.set_bbox_to_anchor(None)
+
+
+def place_legend(ax, handles=None, labels=None, **kwargs):
+    """Create (or, if `ax` already has one and no handles/labels are given, re-place) `ax`'s legend
+    so that it does not overlap any plotted feature (lines, boxes, fills, points, separators).
+
+    The current/requested position is kept if it is already clear; otherwise the 9 in-axes anchor
+    points are tried in turn, then just outside the axes on the right (which savefig's
+    bbox_inches='tight' includes). Overlap is measured on a rendered copy of the figure, so it sees
+    everything actually drawn so far — call it AFTER the data is drawn (the toolkit's own `_save`
+    also re-checks every legend just before writing a PNG). Returns the Legend (None if `ax` has no
+    labeled artists). `loc=` may be passed to choose the preferred first position; other kwargs go
+    to `ax.legend` (defaults: frameon=False, fontsize=8). Needs matplotlib >= 3.8."""
+    leg = ax.get_legend()
+    if handles is not None or labels is not None or leg is None:
+        if handles is None and labels is None and not ax.get_legend_handles_labels()[0]:
+            return None
+        kwargs.setdefault("frameon", False)
+        kwargs.setdefault("fontsize", 8)
+        kwargs["loc"] = "upper right" if kwargs.get("loc", "best") == "best" else kwargs["loc"]
+        leg = ax.legend(handles=handles, labels=labels, **kwargs)
+    if leg is None or not leg.get_visible():
+        return leg
+
+    fig = ax.figure
+    renderer = RendererAgg(int(np.ceil(fig.bbox.width)), int(np.ceil(fig.bbox.height)), fig.dpi)
+    ink = _ink_mask(ax, leg, renderer)
+    if _legend_ink(leg, ink, renderer) == 0:
+        return leg
+
+    candidates = [(loc, None) for loc in _LEGEND_INSIDE_LOCS] + [_LEGEND_OUTSIDE]
+    best, best_score = None, None
+    for loc, anchor in candidates:
+        _move_legend(ax, leg, loc, anchor)
+        score = _legend_ink(leg, ink, renderer)
+        if score == 0:
+            return leg
+        if best_score is None or score < best_score:
+            best, best_score = (loc, anchor), score
+    _move_legend(ax, leg, *best)
+    print(f"  WARNING: legend overlaps plotted features at every position tried "
+          f"({best_score} px at best) — shrink it or enlarge the figure")
+    return leg
+
+
+def _clear_legends(fig) -> None:
+    """Safety net run by `_save`: re-place any legend that ended up on top of the data (e.g. the
+    data was drawn after the legend, or a driver added its own `ax.legend`)."""
+    for ax in fig.axes:
+        if ax.get_legend() is not None:
+            place_legend(ax)
+
+
+# ---------------------------------------------------------------------------
 # Low-level primitives (operate on a passed-in ax; no semantics)
 # ---------------------------------------------------------------------------
 def _run_separators(ax, keys, label_fn=None) -> None:
@@ -902,7 +1012,7 @@ def draw_ecdf(ax, arrays, labels, colors, xlabel) -> None:
         ax.plot(x, y, color=c, lw=1.6, label=str(lab))
     ax.set_xlabel(xlabel)
     ax.set_ylabel("Cumulative fraction")
-    ax.legend(frameon=False, fontsize=8)
+    place_legend(ax)
 
 
 def draw_timecourse(ax, series: dict, colors: dict, xlabel, ylabel) -> None:
@@ -918,7 +1028,7 @@ def draw_timecourse(ax, series: dict, colors: dict, xlabel, ylabel) -> None:
         ax.plot(uniq, avg, color=c, lw=1.5, marker="o", ms=6, zorder=2, label=str(sval))
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
-    ax.legend(frameon=False, fontsize=8)
+    place_legend(ax)
 
 
 def draw_scatter_marginal(fig, subplot_spec, x, y, color, xlabel, ylabel, title) -> None:
@@ -959,6 +1069,7 @@ def _slug(value) -> str:
 def _save(fig, name: str, out_dir) -> None:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    _clear_legends(fig)
     fig.savefig(out_dir / name, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved {out_dir.name}/{name}")
@@ -1072,14 +1183,14 @@ def compare_groups(records, prop, ylabel, datatype, fig_dir, *, group_col, roles
         draw_boxes(ax, arrays, box_labels, cols, ylabel,
                    sep_keys=sep_keys, sep_label_fn=(lambda v: str(v)) if sep_keys else None)
         if handles:
-            ax.legend(handles=handles, frameon=False, fontsize=8)
+            place_legend(ax, handles=handles)
         ax.set_title(title)
         _save(fig, f"{datatype}_{prop}_box_by_{group_col}.png", fig_dir)
     if "ridge" in kinds:
         fig, ax = plt.subplots(figsize=(9, max(3, len(arrays) * 0.55)))
         draw_ridge(ax, arrays, labels, cols, ylabel)
         if handles:
-            ax.legend(handles=handles, frameon=False, fontsize=8)
+            place_legend(ax, handles=handles)
         ax.set_title(title)
         _save(fig, f"{datatype}_{prop}_ridge_by_{group_col}.png", fig_dir)
 

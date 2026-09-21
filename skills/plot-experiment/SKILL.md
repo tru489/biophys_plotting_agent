@@ -129,7 +129,25 @@ Run the driver. It writes PNGs to `<exp>_fig/` (see the naming grid in `data_sch
 `{datatype}_{metric}_{plottype}_{col}={value}.png`, `..._by_{col}.png`,
 `{datatype}_{propY}_vs_{propX}[_{col}={value}].png`) plus `<exp>_figures.pptx`.
 
+**Legend placement (automatic — a legend must never sit on top of plot features):** every legend
+the toolkit draws goes through `tk.place_legend(ax, ...)`. It renders the figure without the
+legend, and if the legend's box would cover any drawn feature (lines, boxes/whiskers, ridge fills,
+jittered points, group separators) it tries the other in-axes anchor points (upper right → upper
+left → lower right → … → center), and if none is clear it moves the legend just outside the axes on
+the right (`bbox_inches="tight"` keeps it in the PNG). `tk._save` re-checks every legend right
+before writing, so a legend added by a driver (`ax.legend(...)`) or drawn before the data is also
+fixed. **In any hand-rolled plotting code you write, create legends with
+`tk.place_legend(ax, handles=..., loc=<preferred>)` after drawing the data, and write the figure
+with `tk._save(fig, name, FIG_DIR)`** — never a bare `ax.legend(loc="best")` +
+`fig.savefig(...)`, since `"best"` does not reliably avoid boxes, fills or scatter clouds. If you
+must use `fig.savefig` directly, call `tk.place_legend(ax)` immediately before it.
+
 ### 5. Show & hand off
+**Look at the figures before handing off** (open the PNGs) and confirm no legend overlaps a plot
+feature — if one does (e.g. a hand-rolled legend, or the printed `WARNING: legend overlaps plotted
+features at every position tried`), fix it (shrink/trim the legend, enlarge the figure, or route it
+through `tk.place_legend`) and re-run rather than shipping it.
+
 Surface the generated figures and the driver path. Tell the user they can fine-tune the driver
 directly in Claude Code (`ROLE_OVERRIDES`, which columns to group/compare/cross, palettes via
 `COND_COLORS`/`DRUG_COLORS`/`BOOL_COLORS`, ridge bins/overlap, scatter pairs, figure sizes, and
@@ -191,6 +209,8 @@ are exposed for bespoke logic. (k-sigma/3-std is intentionally not built in — 
   the loaders resolve sheets via the metadata `sheet_name` column automatically.
 - `images.h5` (raw `h5py` BF image stacks, alongside `experiment_data.xlsx`) is **not** used by
   these plots.
+- **Legends are auto-placed, not `loc="best"`** — see "Legend placement" in step 3. Needs
+  matplotlib ≥ 3.8 (`Legend.set_loc`); the bundled `environment.yaml` resolves to that or newer.
 - **Box-plot tick labels are auto-trimmed to leftover info only** (see the axis-label convention
   in step 3) — if a customized/hand-rolled box plot looks like it's duplicating its own title or
   bold separators on every tick, that's a bug to fix the same way, not a one-off label edit.

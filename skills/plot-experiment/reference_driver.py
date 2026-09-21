@@ -102,6 +102,10 @@ def main() -> None:
     #   tk.facet(ifxm, "mass", "Buoyant mass (pg)", "ifxm", FIG_DIR, facet_col="media")
     #   tk.cross_groups(ifxm, "mass", "Buoyant mass (pg)", "ifxm", FIG_DIR,
     #                   cols=("is_activated", "media"))   # crossing on request
+    #
+    # Hand-rolled figures: legends must not cover the data. Draw the data first, then
+    #   tk.place_legend(ax, handles=[...], loc="upper right")   # moves itself if that spot is busy
+    #   tk._save(fig, "my_fig.png", FIG_DIR)                    # also re-checks every legend
 
     tk.save_pptx(FIG_DIR, PPTX_OUT)
 
