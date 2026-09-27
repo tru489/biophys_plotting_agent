@@ -26,7 +26,10 @@ import biophys_plot_toolkit as tk
 # timestamped output dir it needs (set one to None if that half of the experiment doesn't exist):
 #   iFXM   -> compile_experiment.py's '<...>_compiled/' dir      (holds experiment_data.xlsx)
 #   Coulter-> annotate_coulter_samples.py's '<...>_coulter_sample_annotation/' dir
-EXP_NAME     = "<exp>"
+# EXP_NAME names the deck and MUST keep the analysis dir's date prefix
+# (e.g. '2026-09-22_fl5_wnki_conc-curves'). The driver lives in that dir, so derive it; if the dir
+# has no YYYY-MM-DD / YYYYMMDD prefix, hardcode the dated name instead.
+EXP_NAME     = Path(__file__).resolve().parent.name
 COMPILED_DIR = Path(r"C:\path\to\<...>_compiled")                    # iFXM (or None)
 COULTER_DIR  = Path(r"C:\path\to\<...>_coulter_sample_annotation")   # Coulter (or None)
 # COMPILED_DIR = Path("/Users/you/.../<...>_compiled")              # macOS
@@ -56,6 +59,12 @@ SCATTER_PAIRS = [
 # e.g. {"dose_uM": "ordered", "plate": "categorical"}. Leave empty to accept the inferred roles.
 ROLE_OVERRIDES = {}
 
+# Grid-search heatmaps (two columns varied jointly, e.g. osmolarity x drug dose). EMPTY by default:
+# render_plan lists any grid-like column pairs as suggestions — add one here only after the user
+# confirms. Each entry is (x_col, y_col), or {"cols": (x_col, y_col), "show_repeats": True} to also
+# show repeated control samples individually beside the grid (the grid cell shows their mean).
+GRID_PAIRS = []
+
 
 def main() -> None:
     print(f"=== plotting {EXP_NAME} ===")
@@ -80,7 +89,7 @@ def main() -> None:
     if ifxm:
         roles = tk.infer_roles(ifxm, overrides=ROLE_OVERRIDES)
         plan = tk.build_plan(ifxm, "ifxm", roles=roles, props=list(IFXM_LABELS),
-                             scatter_pairs=SCATTER_PAIRS)
+                             scatter_pairs=SCATTER_PAIRS, grid_pairs=GRID_PAIRS)
         print(tk.render_plan(plan))       # review; set ROLE_OVERRIDES for any [CONFIRM] columns
         tk.autoplot(ifxm, plan, "ifxm", FIG_DIR, prop_labels=IFXM_LABELS,
                     paired_records=ifxm_paired)
@@ -88,7 +97,8 @@ def main() -> None:
     # --- Coulter --------------------------------------------------------------------------
     if coulter:
         croles = tk.infer_roles(coulter, overrides=ROLE_OVERRIDES)
-        cplan = tk.build_plan(coulter, "coulter", roles=croles, props=list(COULTER_LABELS))
+        cplan = tk.build_plan(coulter, "coulter", roles=croles, props=list(COULTER_LABELS),
+                              grid_pairs=GRID_PAIRS)
         print(tk.render_plan(cplan))
         tk.autoplot(coulter, cplan, "coulter", FIG_DIR, prop_labels=COULTER_LABELS)
 
@@ -102,6 +112,8 @@ def main() -> None:
     #   tk.facet(ifxm, "mass", "Buoyant mass (pg)", "ifxm", FIG_DIR, facet_col="media")
     #   tk.cross_groups(ifxm, "mass", "Buoyant mass (pg)", "ifxm", FIG_DIR,
     #                   cols=("is_activated", "media"))   # crossing on request
+    #   tk.grid_heatmap(ifxm, "density", "Density (g/mL)", "ifxm", FIG_DIR,
+    #                   cols=("osm_mOsmL", "dose_uM"), show_repeats=True)   # grid search, confirmed
     #
     # Hand-rolled figures: legends must not cover the data. Draw the data first, then
     #   tk.place_legend(ax, handles=[...], loc="upper right")   # moves itself if that spot is busy

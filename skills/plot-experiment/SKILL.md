@@ -21,7 +21,8 @@ re-run the heavy analysis pipeline.
 
 Bundled files (reference via `${CLAUDE_PLUGIN_ROOT}/skills/plot-experiment/`):
 - `biophys_plot_toolkit.py` — the library: loaders → `infer_roles` → low-level `draw_*` →
-  combinators (`plot_grouped`/`compare_groups`/`timecourse_by`/`scatter_by`/`facet`/`cross_groups`)
+  combinators (`plot_grouped`/`compare_groups`/`timecourse_by`/`scatter_by`/`facet`/`cross_groups`/
+  `grid_heatmap`)
   → `build_plan`/`render_plan`/`autoplot` → pptx.
 - `reference_driver.py` — the driver template you adapt.
 - `references/data_schema.md` — the exact xlsx/csv/metadata schema + role table. **Read it first.**
@@ -63,6 +64,22 @@ the list of proposed plots. **Always present this and get approval/overrides bef
 driver** (this is a hard requirement). The user resolves `[CONFIRM]` columns and can re-map
 anything via `overrides={col: "ordered"|"categorical"|...}`.
 
+**Grid-search heatmaps — suggest, never assume.** If two annotation columns were varied *together*
+across samples (a grid search, e.g. media osmolarity × drug dose), a heatmap of the per-sample mean
+over the two-parameter grid (`tk.grid_heatmap`) is often the clearest summary. `render_plan` lists
+any such pairs it detects (`tk.suggest_grids`: both columns boolean/categorical/ordered, ≥3 levels
+on one axis, genuinely crossed rather than 1:1, ≥75% of combos present) under **"Suggested grid
+heatmaps — NOT included"**. Do not add them on your own:
+- If a suggestion appears **and** you judge it meaningful given the metadata (the columns really
+  are two independently varied parameters, not e.g. a sample ID crossed with a batch), ask the user
+  with `AskUserQuestion` whether to add the heatmap, naming the two columns and the grid shape.
+  Mention any repeated combination (usually a control re-run through the session): by default the
+  grid cell shows the mean of those repeats (marked "mean of n=k"); offer `show_repeats=True` to
+  also show each repeat individually in a side panel on the same color scale (to see drift).
+- Only on a yes, put the pair in the driver's `GRID_PAIRS` (`[(x_col, y_col)]`, or
+  `[{"cols": (x_col, y_col), "show_repeats": True}]`). With no suggestion, or a no, leave it empty.
+- Pairs that the detector misses can still be added if the user asks for a grid heatmap.
+
 Behavior to convey: **every** boolean/categorical/approved-ordered column becomes its own grouping
 axis (no cardinality cap — everything is plotted; reorganize on a later pass). Multiple columns are
 handled **independently** by default; cross-products are available on request via `cross_groups`. A
@@ -88,7 +105,14 @@ loudly rather than silently falling back.
    self-contained, git-committable, reproducible independent of the plugin install).
 2. Adapt `reference_driver.py` into that dir: set `EXP_NAME`, `COMPILED_DIR` (iFXM) and/or
    `COULTER_DIR` (Coulter, `None` if absent), `FIG_DIR`, `PPTX_OUT`, and set
-   `ROLE_OVERRIDES` to the choices the user made in step 2 (resolving every `[CONFIRM]`). The
+   `ROLE_OVERRIDES` to the choices the user made in step 2 (resolving every `[CONFIRM]`) and
+   `GRID_PAIRS` to any grid heatmaps the user confirmed (else leave it `[]`).
+   **`EXP_NAME` must be the full analysis dir name including its date prefix** (e.g.
+   `2026-09-22_fl5_wnki_conc-curves` → `2026-09-22_fl5_wnki_conc-curves_figures.pptx`) — never a
+   shortened, dateless form. The template derives it from the driver's own dir
+   (`Path(__file__).resolve().parent.name`); keep that when the driver lives in the dated analysis
+   dir, otherwise hardcode the dated name (prefix the experiment date if the dir has none).
+   `save_pptx` warns if the deck name has no date prefix — treat that warning as a bug. The
    template's default path is `infer_roles → build_plan → render_plan(print) → autoplot`; keep it
    for the standard grid, or drive the **explicit combinators** for full control:
    - `plot_grouped(group_col=…)` — per-group detail (ridge + box).
@@ -98,6 +122,8 @@ loudly rather than silently falling back.
    - `scatter_by(prop_x, prop_y, group_col=…)` — per-cell scatter + marginals; **pass
      `load_ifxm_paired` records** (row-aligned).
    - `cross_groups(cols=(a, b))` — cross-product comparison, on request.
+   - `grid_heatmap(cols=(x, y), show_repeats=False)` — grid-search heatmap of per-sample means
+     (`agg="mean"`; repeated cells averaged), **only when the user confirmed it** (see step 2).
    - `facet(facet_col=…)` — compact one-figure grid.
    Keep `import biophys_plot_toolkit as tk` — do **not** inline helpers. No statistical outlier
    rejection is applied; tame a heavy tail with axis limits in the driver.
@@ -127,7 +153,8 @@ A conda env spec is bundled at `${CLAUDE_PLUGIN_ROOT}/environment.yaml`
 (`conda env create -f ...` then activate `biophys_plotting`), or reuse an existing analysis env.
 Run the driver. It writes PNGs to `<exp>_fig/` (see the naming grid in `data_schema.md`:
 `{datatype}_{metric}_{plottype}_{col}={value}.png`, `..._by_{col}.png`,
-`{datatype}_{propY}_vs_{propX}[_{col}={value}].png`) plus `<exp>_figures.pptx`.
+`{datatype}_{propY}_vs_{propX}[_{col}={value}].png`, `{datatype}_{prop}_heatmap_{colX}-x-{colY}.png`)
+plus `<exp>_figures.pptx` (with `<exp>` the dated analysis dir name).
 
 **Legend placement (automatic — a legend must never sit on top of plot features):** every legend
 the toolkit draws goes through `tk.place_legend(ax, ...)`. It renders the figure without the

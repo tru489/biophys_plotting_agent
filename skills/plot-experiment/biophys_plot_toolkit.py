@@ -12,8 +12,9 @@ Three layers, low -> high:
                          time / ordered / continuous / label / structural) so the driver (and
                          Claude) can decide how to group, compare, order and color the data.
   * draw_*            -> low-level primitives: draw on a passed-in axis, no semantics.
-  * plot_grouped / compare_groups / timecourse_by / scatter_by / facet / cross_groups
-                      -> mid-level combinators parameterized by WHICH column(s) to use.
+  * plot_grouped / compare_groups / timecourse_by / scatter_by / facet / cross_groups /
+    grid_heatmap      -> mid-level combinators parameterized by WHICH column(s) to use.
+                         (suggest_grids flags grid-search column pairs for grid_heatmap.)
   * build_plan / render_plan / autoplot
                       -> high-level: infer a plot plan from the roles, show it, execute it.
 
@@ -952,13 +953,18 @@ def _run_separators(ax, keys, label_fn=None) -> None:
     """Bold labels under the axis with dark vertical separators between runs of equal `keys`."""
     trans = blended_transform_factory(ax.transData, ax.transAxes)
     n = len(keys)
+    # long rotated tick labels reach below the default label row; push the bold labels below them
+    max_tick = max((len(t.get_text()) for t in ax.get_xticklabels()), default=0)
+    y_lab = -0.30 - (0.12 if max_tick > 20 else 0.0)
     prev, start = object(), 0
     for i, k in enumerate(list(keys) + [object()]):
         if i == n or k != prev:
             if i > 0 and start < n:
                 mid = (start + i - 1) / 2
                 lab = label_fn(prev) if label_fn else str(prev)
-                ax.text(mid, -0.30, lab, ha="center", va="top", transform=trans,
+                if i - start <= 2:      # narrow run: stack "a | b" so neighbours don't collide
+                    lab = lab.replace(" | ", "\n")
+                ax.text(mid, y_lab, lab, ha="center", va="top", transform=trans,
                         fontsize=9, fontweight="bold")
                 if i < n:
                     ax.axvline(i - 0.5, color="black", lw=1.2, alpha=0.8, zorder=1)
@@ -1336,16 +1342,194 @@ def cross_groups(records, prop, ylabel, datatype, fig_dir, *, cols, roles=None,
 
 
 # ---------------------------------------------------------------------------
+# Grid search: two columns varied jointly -> heatmap of per-sample means
+# ---------------------------------------------------------------------------
+_GRID_ROLES = ("boolean", "categorical", "ordered")
+
+
+def suggest_grids(records, roles=None, *, min_coverage=0.75, exclude=()) -> list:
+    """Detect pairs of annotation columns that look like a GRID SEARCH (two parameters varied
+    together across samples), for grid_heatmap. Only a SUGGESTION — never plotted by default; the
+    user must confirm before a pair goes into build_plan(grid_pairs=...).
+    A pair (a, b) qualifies when both are boolean/categorical/ordered with >= 2 levels (>= 3 on at
+    least one), the samples actually cross them (more distinct combos than either column has
+    levels, so the two aren't 1:1 / confounded), and >= `min_coverage` of the a x b combos exist.
+    Time columns are never proposed. The column with more levels goes on x (ties: metadata order).
+    Returns [{cols:(x, y), shape:(nx, ny), filled, coverage, repeats:{(xv, yv): n}}], best first."""
+    roles = roles or infer_roles(records)
+    cands = [c for c, i in roles.items() if i["role"] in _GRID_ROLES and c not in exclude
+             and len(group_order(records, c, roles)) >= 2]
+    out = []
+    for i, a in enumerate(cands):
+        for b in cands[i + 1:]:
+            recs = [r for r in records if rget(r, a) is not None and rget(r, b) is not None]
+            na, nb = len(group_order(recs, a, roles)), len(group_order(recs, b, roles))
+            if max(na, nb) < 3:
+                continue
+            counts = {}
+            for r in recs:
+                key = (rget(r, a), rget(r, b))
+                counts[key] = counts.get(key, 0) + 1
+            if len(counts) <= max(na, nb):
+                continue
+            coverage = len(counts) / (na * nb)
+            if coverage < min_coverage:
+                continue
+            x, y, nx, ny = (a, b, na, nb) if na >= nb else (b, a, nb, na)
+            repeats = {(k if x == a else k[::-1]): n for k, n in counts.items() if n > 1}
+            out.append({"cols": (x, y), "shape": (nx, ny), "filled": len(counts),
+                        "coverage": coverage, "repeats": repeats})
+    return sorted(out, key=lambda s: (-s["coverage"], -s["filled"]))
+
+
+def _grid_tick(col, value, roles) -> str:
+    """Heatmap axis tick: numeric ordered values compactly ('0.0625', '0' not '0.0')."""
+    if roles.get(col, {}).get("role") == "ordered":
+        try:
+            return f"{float(value):g}"
+        except (TypeError, ValueError):
+            pass
+    return value_label(col, value, roles)
+
+
+def _wrap_label(label, width=14) -> str:
+    """Break a long sample/annotation label onto lines at '_', ' ', '-' or '|' so it fits a cell."""
+    parts = re.split(r"(?<=[_\s|-])", str(label))
+    lines, cur = [], ""
+    for p in parts:
+        if cur and len(cur) + len(p) > width:
+            lines.append(cur)
+            cur = ""
+        cur += p
+    return "\n".join(lines + [cur]).strip()
+
+
+def _grid_fmt(values) -> str:
+    """Enough decimals to resolve the spread of the plotted values (density ~4, mass/vol ~0-1)."""
+    v = np.asarray([x for x in values if np.isfinite(x)], float)
+    spread = np.ptp(v) if v.size > 1 else (abs(v[0]) if v.size else 1.0)
+    dec = int(np.clip(np.ceil(-np.log10(spread)) + 2, 0, 6)) if spread > 0 else 2
+    return f"{{:.{dec}f}}"
+
+
+def _annotate_cells(ax, arr, cmap, norm, fmt, notes=None) -> None:
+    """Print each finite cell's value (plus an optional small note line) in a contrasting color."""
+    for (i, j), v in np.ndenumerate(arr):
+        if not np.isfinite(v):
+            continue
+        r, g, b, _ = cmap(norm(v))
+        color = "white" if 0.299 * r + 0.587 * g + 0.114 * b < 0.5 else "black"
+        note = (notes or {}).get((i, j))
+        ax.text(j, i, fmt.format(v) + (f"\n{note}" if note else ""), ha="center", va="center",
+                fontsize=8 if note else 10, color=color)
+
+
+def grid_heatmap(records, prop, label, datatype, fig_dir, *, cols, roles=None, agg="mean",
+                 show_repeats=False, cmap="viridis", fmt=None) -> None:
+    """GRID SEARCH over two jointly-varied columns: a heatmap with cols[0] on x and cols[1] on y.
+    Each sample is reduced to one number (agg='mean' of its cells, or 'median'); each grid cell is
+    that sample value, or — when several samples share the cell (typically a control condition
+    re-run through the session) — the average of those samples, marked 'mean of n=k'. Missing
+    combinations are grey. show_repeats=True adds a side panel on the SAME color scale showing
+    each repeated sample individually, in run order (to check control drift over the session).
+    Use only when the user confirmed the grid (see suggest_grids) — never added by default.
+    File: {datatype}_{prop}_heatmap_{colX}-x-{colY}.png"""
+    x_col, y_col = cols
+    recs = [r for r in _with_prop(records, prop)
+            if rget(r, x_col) is not None and rget(r, y_col) is not None]
+    if not recs:
+        return
+    roles = roles or infer_roles(records)
+    stat = {"mean": np.mean, "median": np.median}[agg]
+    xs, ys = group_order(recs, x_col, roles), group_order(recs, y_col, roles)
+    time_col = _find_time_col(records, roles)
+
+    cell = {}                                       # (xv, yv) -> [records], in run order
+    for r in (sort_records(recs, [time_col], roles) if time_col else recs):
+        cell.setdefault((rget(r, x_col), rget(r, y_col)), []).append(r)
+    grid = np.full((len(ys), len(xs)), np.nan)
+    notes = {}
+    for (xv, yv), rs in cell.items():
+        i, j = ys.index(yv), xs.index(xv)
+        grid[i, j] = np.mean([stat(r["props"][prop]) for r in rs])
+        if len(rs) > 1:
+            notes[(i, j)] = f"(mean of n={len(rs)})"
+    repeated = [(k, rs) for k, rs in cell.items() if len(rs) > 1] if show_repeats else []
+
+    rep_arr = None
+    if repeated:
+        width = max(len(rs) for _, rs in repeated)
+        rep_arr = np.full((len(repeated), width), np.nan)
+        for i, (_, rs) in enumerate(repeated):
+            rep_arr[i, :len(rs)] = [stat(r["props"][prop]) for r in rs]
+    shown = np.concatenate([grid.ravel()] + ([rep_arr.ravel()] if rep_arr is not None else []))
+    finite = shown[np.isfinite(shown)]
+    vmin, vmax = finite.min(), finite.max()
+    if vmin == vmax:
+        vmin, vmax = vmin - 0.5, vmax + 0.5
+    fmt = fmt or _grid_fmt(finite)
+    cm = plt.get_cmap(cmap).copy()
+    cm.set_bad("#e6e6e6")
+    norm = plt.Normalize(vmin, vmax)
+
+    grid_w = max(4.0, 1.25 * len(xs))
+    h = max(3.5, 0.85 * len(ys) + 1.8)
+    if rep_arr is not None:
+        rep_w = max(2.5, 1.4 * rep_arr.shape[1])
+        fig, (ax, axr) = plt.subplots(1, 2, figsize=(grid_w + rep_w + 2.5, h), gridspec_kw=dict(
+            width_ratios=[grid_w, rep_w], wspace=0.35))
+    else:
+        fig, ax = plt.subplots(figsize=(grid_w + 2, h))
+        axr = None
+
+    im = ax.imshow(np.ma.masked_invalid(grid), cmap=cm, norm=norm, aspect="auto")
+    _annotate_cells(ax, grid, cm, norm, fmt, notes)
+    ax.set_xticks(range(len(xs)), [_grid_tick(x_col, v, roles) for v in xs])
+    ax.set_yticks(range(len(ys)), [_grid_tick(y_col, v, roles) for v in ys])
+    ax.set_xlabel(x_col)
+    ax.set_ylabel(y_col)
+
+    if axr is not None:
+        axr.imshow(np.ma.masked_invalid(rep_arr), cmap=cm, norm=norm, aspect="auto")
+        # label each repeat by whatever annotation is left to tell them apart (else sample name):
+        # on the x ticks when there's one repeated condition, else inside each cell
+        rep_labels = [[_wrap_label(_leftover_label(r, roles, {x_col, y_col})) for r in rs]
+                      for _, rs in repeated]
+        ticks = [f"#{j + 1}" for j in range(rep_arr.shape[1])]
+        if len(repeated) == 1:
+            ticks = [f"{t}\n{lab}" for t, lab in zip(ticks, rep_labels[0])]
+            _annotate_cells(axr, rep_arr, cm, norm, fmt)
+        else:
+            _annotate_cells(axr, rep_arr, cm, norm, fmt, {
+                (i, j): lab for i, labs in enumerate(rep_labels) for j, lab in enumerate(labs)})
+        axr.set_yticks(range(len(repeated)),
+                       [f"{_grid_tick(x_col, xv, roles)} | {_grid_tick(y_col, yv, roles)}"
+                        for (xv, yv), _ in repeated])
+        axr.set_xticks(range(rep_arr.shape[1]), ticks, fontsize=7 if len(repeated) == 1 else None)
+        axr.set_xlabel("repeat, in run order")
+        axr.set_title("Repeated controls (individually)", fontsize=10)
+        fig.colorbar(im, ax=[ax, axr], label=label, fraction=0.04, pad=0.03)
+    else:
+        fig.colorbar(im, ax=ax, label=label, fraction=0.05, pad=0.03)
+    ax.set_title(f"{datatype} {prop} — {agg} per sample, {x_col} × {y_col}", fontsize=10)
+    _save(fig, f"{datatype}_{prop}_heatmap_{x_col}-x-{y_col}.png", fig_dir)
+
+
+# ---------------------------------------------------------------------------
 # High-level: infer a plot plan, show it, execute it
 # ---------------------------------------------------------------------------
 def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
-               include_ordered=True) -> dict:
+               grid_pairs=None, include_ordered=True) -> dict:
     """Infer a plot plan (list of PlotSpecs) from the column roles. For every boolean / categorical
     (and, if include_ordered, approved ordered) column: a plot_grouped + a compare_groups per prop.
     If a time column exists: a timecourse per prop, split by each grouping column. Scatters are
     added for scatter_pairs. `props` is filtered to those non-empty in at least one record, so a
-    mass-only / volume-only experiment proposes no no-op plots for absent properties. Returns
-    {roles, props, plots:[{fn,prop,kwargs,rationale}]}."""
+    mass-only / volume-only experiment proposes no no-op plots for absent properties.
+    Grid heatmaps are added ONLY for the user-confirmed `grid_pairs` — each an (x_col, y_col) tuple
+    or {"cols": (x, y), "show_repeats": True, ...} (extra keys go to grid_heatmap). Grid-like
+    column pairs found by suggest_grids but not in grid_pairs are listed under
+    'grid_suggestions' for render_plan to offer — never plotted by default. Returns
+    {roles, props, plots:[{fn,prop,kwargs,rationale}], grid_suggestions}."""
     roles = roles or infer_roles(records)
     present = {k for r in records for k, v in r["props"].items() if len(v) > 0}
     props = [p for p in (props if props is not None else present) if p in present]
@@ -1378,7 +1562,17 @@ def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
                       "kwargs": {"prop_x": px, "prop_y": py, "xlabel": xl, "ylabel": yl,
                                  "group_col": gc},
                       "rationale": "per-cell scatter" + (f" per {gc}" if gc else "")})
-    return {"roles": roles, "props": props, "plots": plots}
+    confirmed = set()
+    for gp in (grid_pairs or []):
+        kw = dict(gp) if isinstance(gp, dict) else {"cols": tuple(gp)}
+        kw["cols"] = tuple(kw["cols"])
+        confirmed.add(frozenset(kw["cols"]))
+        for prop in props:
+            plots.append({"fn": "grid_heatmap", "prop": prop, "kwargs": kw,
+                          "rationale": f"grid heatmap {kw['cols'][0]} × {kw['cols'][1]}"})
+    suggestions = [s for s in suggest_grids(records, roles)
+                   if frozenset(s["cols"]) not in confirmed]
+    return {"roles": roles, "props": props, "plots": plots, "grid_suggestions": suggestions}
 
 
 def render_plan(plan) -> str:
@@ -1399,6 +1593,20 @@ def render_plan(plan) -> str:
     lines.append(f"Proposed plots ({len(plan['plots'])}):")
     for p in plan["plots"]:
         lines.append(f"  - {p['fn']}({p['prop']}) — {p['rationale']}")
+    sugg = plan.get("grid_suggestions") or []
+    if sugg:
+        lines.append("")
+        lines.append("Suggested grid heatmaps — NOT included; ask the user, add to GRID_PAIRS "
+                     "only if confirmed:")
+        for s in sugg:
+            (x, y), (nx, ny) = s["cols"], s["shape"]
+            rep = ""
+            if s["repeats"]:
+                rep = "; repeated: " + ", ".join(
+                    f"{_grid_tick(x, a, roles)} | {_grid_tick(y, b, roles)} ×{n}"
+                    for (a, b), n in s["repeats"].items())
+            lines.append(f"  - {x} × {y}: {nx}×{ny} grid, {s['filled']}/{nx * ny} combos "
+                         f"filled{rep}")
     return "\n".join(lines)
 
 
@@ -1413,7 +1621,7 @@ def autoplot(records, plan, datatype, fig_dir, prop_labels=None, paired_records=
     if _COMBINATORS is None:
         _COMBINATORS = {"plot_grouped": plot_grouped, "compare_groups": compare_groups,
                         "timecourse_by": timecourse_by, "scatter_by": scatter_by,
-                        "facet": facet}
+                        "facet": facet, "grid_heatmap": grid_heatmap}
     labels = prop_labels or {}
     roles = plan["roles"]
     warned = False
@@ -1436,12 +1644,17 @@ def autoplot(records, plan, datatype, fig_dir, prop_labels=None, paired_records=
 # PowerPoint export
 # ---------------------------------------------------------------------------
 def save_pptx(fig_dir, out_path) -> None:
-    """Compile every PNG in fig_dir into a 16:9 deck, one image per slide (centered, aspect-fit)."""
+    """Compile every PNG in fig_dir into a 16:9 deck, one image per slide (centered, aspect-fit).
+    The deck name should start with the analysis dir's date (e.g. '2026-09-22_<exp>_figures.pptx')
+    — a warning is printed if it doesn't."""
     from PIL import Image as PILImage
     from pptx import Presentation
     from pptx.util import Inches, Emu
 
     fig_dir, out_path = Path(fig_dir), Path(out_path)
+    if not re.match(r"\d{4}-?\d{2}-?\d{2}", out_path.name):
+        print(f"  WARNING: {out_path.name} has no date prefix — set EXP_NAME to the full analysis "
+              f"dir name (e.g. '2026-09-22_<exp>')")
     prs = Presentation()
     slide_w, slide_h = Inches(13.33), Inches(7.5)
     prs.slide_width, prs.slide_height = slide_w, slide_h

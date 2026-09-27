@@ -129,6 +129,9 @@ Notes:
   (or `infer_roles(overrides={col: "ordered"|"categorical"})`) pins them.
 - **No cardinality cap** — every categorical value is plotted; reorganize on a later pass. Multiple
   columns are handled independently; use `cross_groups(cols=(a, b))` for a cross-product on request.
+- **Grid search** — two columns varied jointly (e.g. osmolarity × drug dose) are detected by
+  `suggest_grids` and listed by `render_plan` as *suggested* heatmaps; they're only plotted
+  (`grid_heatmap`) once the user confirms and the pair is added to the driver's `GRID_PAIRS`.
 - Replicate is parsed from `rep\d+` in `sample_name` and exposed as `meta["rep"]` for ordering/labels.
 - `condition`/`drug_name` still get the reference value fixups (`drug_treat`→`drug_treated`;
   drug lowercased, `zt1a`→`zt-1a`) via `VALUE_NORMALIZERS` (overridable per loader).
@@ -148,6 +151,8 @@ Grouping/ordering columns are chosen at plot time by passing `group_col=` / `ser
 
 ## Output naming grid
 
+`<exp>` (`EXP_NAME`) is the full analysis dir name **including its date prefix**
+(e.g. `2026-09-22_fl5_wnki_conc-curves`), so decks are `2026-09-22_fl5_wnki_conc-curves_figures.pptx`.
 Figures go to `<exp>_fig/`; the deck to `<exp>_figures.pptx`. File names:
 
 ```
@@ -157,6 +162,7 @@ Figures go to `<exp>_fig/`; the deck to `<exp>_figures.pptx`. File names:
 {datatype}_{prop}_facet_{col}.png                  # compact one-figure grid
 {datatype}_{propY}_vs_{propX}[_{col}={slug(value)}].png   # per-cell scatter + marginals
 {datatype}_{prop}_{kind}_by_{colA}-x-{colB}.png    # cross_groups (crossing on request)
+{datatype}_{prop}_heatmap_{colX}-x-{colY}.png      # grid_heatmap (grid search, user-confirmed)
 ```
 
 - `datatype` ∈ {`coulter`, `ifxm`}
