@@ -65,6 +65,7 @@ DRUG_COLORS = {  # keys match the lowercased output of _norm_drug
 # High-contrast, colorblind-accommodating pair for booleans: [falsey, truthy] (Okabe-Ito).
 BOOL_COLORS = ["#0072B2", "#D55E00"]  # blue (false) vs vermillion (true)
 FALLBACK_COLOR = "#999999"
+_N_COLOR = "#555555"   # muted gray for the per-row / per-box "n=" point counts
 
 # Colorblind-safe cycle (Okabe-Ito + a few extensions) for auto-assigning colors to unknown values.
 _AUTO_PALETTE = [
@@ -923,7 +924,9 @@ def place_legend(ax, handles=None, labels=None, **kwargs):
     if _legend_ink(leg, ink, renderer) == 0:
         return leg
 
-    candidates = [(loc, None) for loc in _LEGEND_INSIDE_LOCS] + [_LEGEND_OUTSIDE]
+    out_loc, (ox, oy) = _LEGEND_OUTSIDE        # clear anything drawn in the right margin (ridge n=)
+    outside = (out_loc, (ox + getattr(ax, "_right_margin", 0.0), oy))
+    candidates = [(loc, None) for loc in _LEGEND_INSIDE_LOCS] + [outside]
     best, best_score = None, None
     for loc, anchor in candidates:
         _move_legend(ax, leg, loc, anchor)
@@ -987,6 +990,13 @@ def draw_ridge(ax, arrays, labels, colors, xlabel, overlap: float = 1.7) -> None
     ax.set_yticks([n - 1 - i for i in range(n)])
     ax.set_yticklabels(labels, fontsize=7)
     ax.set_xlabel(xlabel)
+    # n per row, just outside the right edge of the axes (level with the row's baseline) so it
+    # can never cover a ridge; an outside-right legend is pushed past these labels.
+    trans = blended_transform_factory(ax.transAxes, ax.transData)
+    for i, vals in enumerate(arrays):
+        ax.text(1.01, n - 1 - i, f"n={len(vals)}", transform=trans, ha="left", va="bottom",
+                fontsize=6.5, color=_N_COLOR, clip_on=False)
+    ax._right_margin = 0.07
 
 
 def draw_boxes(ax, arrays, labels, colors, ylabel, sep_keys=None, sep_label_fn=None) -> None:
@@ -1000,6 +1010,17 @@ def draw_boxes(ax, arrays, labels, colors, ylabel, sep_keys=None, sep_label_fn=N
                    boxprops=dict(facecolor=c, alpha=0.5),
                    medianprops=dict(color="black", linewidth=1.5),
                    whiskerprops=dict(color=c), capprops=dict(color=c))
+    # n per box, just above its highest plotted point (headroom added so it stays in the axes)
+    tops = [np.max(v) for v in arrays if len(v)]
+    if tops:
+        lo, hi = min(np.min(v) for v in arrays if len(v)), max(tops)
+        pad = (hi - lo) * 0.02 or abs(hi) * 0.02 or 0.02
+        for i, vals in enumerate(arrays):
+            if len(vals):
+                ax.text(i, np.max(vals) + pad, f"n={len(vals)}", ha="center", va="bottom",
+                        fontsize=6.5, color=_N_COLOR)
+        y0, y1 = ax.get_ylim()
+        ax.set_ylim(y0, max(y1, hi + pad * 6))
     ax.set_xticks(range(n))
     ax.set_xticklabels(labels, fontsize=7, rotation=45, ha="right")
     if sep_keys is not None:

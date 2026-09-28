@@ -156,6 +156,11 @@ Run the driver. It writes PNGs to `<exp>_fig/` (see the naming grid in `data_sch
 `{datatype}_{propY}_vs_{propX}[_{col}={value}].png`, `{datatype}_{prop}_heatmap_{colX}-x-{colY}.png`)
 plus `<exp>_figures.pptx` (with `<exp>` the dated analysis dir name).
 
+**Point counts (automatic):** every ridge row shows its `n=` (number of points plotted) in small
+gray text just outside the right edge of the axes, and every box shows its `n=` just above its
+highest plotted point (with headroom added to the y-axis) — both via `draw_ridge`/`draw_boxes`, so
+all combinators get them. Keep this in hand-rolled ridge/box plots (use those primitives).
+
 **Legend placement (automatic — a legend must never sit on top of plot features):** every legend
 the toolkit draws goes through `tk.place_legend(ax, ...)`. It renders the figure without the
 legend, and if the legend's box would cover any drawn feature (lines, boxes/whiskers, ridge fills,
