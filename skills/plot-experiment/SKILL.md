@@ -93,6 +93,15 @@ heatmaps — NOT included"**. Do not add them on your own:
   `[{"cols": (x_col, y_col), "show_repeats": True}]`). With no suggestion, or a no, leave it empty.
 - Pairs that the detector misses can still be added if the user asks for a grid heatmap.
 
+**Outlier rejection — ask every run (hard requirement).** Alongside the plan approval, always ask
+with `AskUserQuestion` whether to apply outlier rejection. Propose, as the first
+"(Recommended)" option, **Tukey fences (`iqr`, k=1.5), `per_sample` scope, on mass, volume and
+density** (every one of iFXM `mass`/`density`/`vol` and Coulter `volume` that the experiment
+has). Other options: **none** (plot verbatim), and **customize** (then walk through the full menu
+in "Outlier rejection" below). When reusing a past analysis (step 0), also offer the past
+analysis's spec as an option if it differs. Wire the answer into the driver (see that section)
+before running it; never skip the question even if the user already approved the plot plan.
+
 Behavior to convey: **every** boolean/categorical/approved-ordered column becomes its own grouping
 axis (no cardinality cap — everything is plotted; reorganize on a later pass). Multiple columns are
 handled **independently** by default; cross-products are available on request via `cross_groups`. A
@@ -138,8 +147,9 @@ loudly rather than silently falling back.
    - `grid_heatmap(cols=(x, y), show_repeats=False)` — grid-search heatmap of per-sample means
      (`agg="mean"`; repeated cells averaged), **only when the user confirmed it** (see step 2).
    - `facet(facet_col=…)` — compact one-figure grid.
-   Keep `import biophys_plot_toolkit as tk` — do **not** inline helpers. No statistical outlier
-   rejection is applied; tame a heavy tail with axis limits in the driver.
+   Keep `import biophys_plot_toolkit as tk` — do **not** inline helpers. Add the
+   `reject_outliers` lines the user chose in step 2 (none if they declined); beyond that, tame a
+   heavy tail with axis limits in the driver.
 
 **Axis-label convention (default, automatic — general principle, not just this dataset):**
 never repeat on a per-sample tick something the figure already states via its title or its bold
@@ -213,14 +223,22 @@ limits, excluded samples, palettes, hand-rolled figures). No prose about results
 fine-tunes and you re-run, update the notes to match the final driver — they must never describe
 an older state.
 
-## Outlier rejection (opt-in — the loaders never trim data)
+## Outlier rejection (asked every run — the loaders never trim data)
 
-By default **no statistical outlier rejection** is applied — the data is loaded verbatim so the user
-can decide per experiment / per sample. The toolkit provides an opt-in transform, `reject_outliers`,
-that returns cleaned records feeding straight into `build_plan`/`autoplot`/any combinator, so one
-call cleans every downstream plot.
+The loaders apply **no statistical outlier rejection** — data is loaded verbatim, and trimming
+happens only through the explicit `reject_outliers` transform in the driver, which returns cleaned
+records feeding straight into `build_plan`/`autoplot`/any combinator, so one call cleans every
+downstream plot. Step 2 always asks the user whether to use it (recommended default: Tukey fences,
+per sample, on mass/volume/density):
+```python
+ifxm        = tk.reject_outliers(ifxm, method="iqr", props=["mass", "density", "vol"], scope="per_sample")
+ifxm_paired = tk.reject_outliers(ifxm_paired, method="iqr", props=["mass", "density", "vol"],
+                                 scope="per_sample", paired=True)                      # scatter
+coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"], scope="per_sample")
+```
+(Trim `props` to the properties that exist.)
 
-**When the user brings up outlier rejection at all** (e.g. "add outlier rejection", "trim the density
+**If the user picks "customize", or brings up outlier rejection later** (e.g. "trim the density
 tails", "reject outliers on volume"), do **not** guess — present a menu with `AskUserQuestion`
 enumerating the full spec, then wire the answer into the driver. Ask for:
 
@@ -248,7 +266,7 @@ are exposed for bespoke logic. (k-sigma/3-std is intentionally not built in — 
 ## Gotchas
 - **iFXM gating**: `mass` uses `bm_gate`; `density`/`vol` share one mask on `pair_volume_fl` (the
   paired sample's volume). No statistical outlier rejection is applied by the loaders — only
-  non-finite values are dropped (see the opt-in `reject_outliers` above for trimming). `load_ifxm`
+  non-finite values are dropped (trimming is the driver's `reject_outliers` call, asked every run). `load_ifxm`
   gates mass and the volume props with separate masks (so per-property arrays can differ in
   length); `load_ifxm_paired` uses one shared mask to keep arrays row-aligned — always use it for
   `scatter_by` (and pass `paired_records=` to `autoplot`), or a scatter's x/y won't pair.

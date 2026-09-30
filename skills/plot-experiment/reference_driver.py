@@ -78,14 +78,16 @@ def main() -> None:
         ifxm_paired = tk.load_ifxm_paired(COMPILED_DIR)
     print(f"  coulter samples: {len(coulter)} | ifxm samples: {len(ifxm)}")
 
-    # --- OPTIONAL outlier rejection (OFF by default; data is loaded verbatim otherwise) ----
-    # Uncomment / adapt to trim distributions before plotting. One call cleans every downstream
-    # plot. method 'mad'|'iqr'|'percentile' (per-prop dict allowed); scope 'per_sample'|'pooled';
-    # log=True for log-normal mass/volume. Use paired=True on the scatter records to keep rows
-    # aligned. (Ask Claude "add outlier rejection" to have it fill these in interactively.)
-    #   ifxm        = tk.reject_outliers(ifxm, method={"density": "mad", "mass": "iqr"})
-    #   ifxm_paired = tk.reject_outliers(ifxm_paired, method="mad", props=["density"], paired=True)
-    #   coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"])
+    # --- Outlier rejection (Claude asks each run; data is loaded verbatim otherwise) -------
+    # Recommended default: Tukey fences, per sample, on mass/density/vol (+ coulter volume). One
+    # call cleans every downstream plot. method 'mad'|'iqr'|'percentile' (per-prop dict allowed);
+    # scope 'per_sample'|'pooled'; log=True for log-normal mass/volume. Use paired=True on the
+    # scatter records to keep rows aligned. Delete these lines if the user declines.
+    #   ifxm        = tk.reject_outliers(ifxm, method="iqr", props=["mass", "density", "vol"],
+    #                                    scope="per_sample")
+    #   ifxm_paired = tk.reject_outliers(ifxm_paired, method="iqr", props=["mass", "density", "vol"],
+    #                                    scope="per_sample", paired=True)
+    #   coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"], scope="per_sample")
 
     # --- iFXM: inspect the annotation schema, show the plan, run it -----------------------
     if ifxm:
