@@ -10,9 +10,13 @@ The plugin ships a skill, **`plot-experiment`**, that:
 2. generates a short, self-contained plotting driver on top of a bundled toolkit, and
 3. runs it to produce the standard figure grid — ridge histograms, box+jitter plots, timecourse
    scatters, and per-cell property-vs-property scatters (e.g. volume vs mass / density) — plus a
-   PowerPoint deck.
+   PowerPoint deck,
+4. writes a short `<exp>_analysis_notes.md` next to the deck describing the data structure and
+   plotting choices.
 
-You then fine-tune the generated driver in normal Claude Code.
+You then fine-tune the generated driver in normal Claude Code. To analyze a new dataset the same
+way as a past one, point Claude at the past analysis dir ("plot this like `<past exp>`") — it reads
+that analysis's notes and recapitulates the analysis, flagging any schema differences.
 
 ## Install
 
@@ -65,6 +69,8 @@ biophys_plotting_agent/
 │   ├── SKILL.md                     # the workflow
 │   ├── biophys_plot_toolkit.py      # reusable plotting library
 │   ├── reference_driver.py          # driver template the skill adapts
-│   └── references/data_schema.md    # xlsx/csv/metadata schema
+│   └── references/
+│       ├── data_schema.md                 # xlsx/csv/metadata schema
+│       └── analysis_notes_template.md     # outline for per-analysis notes
 └── environment.yaml                 # conda env for running generated drivers
 ```

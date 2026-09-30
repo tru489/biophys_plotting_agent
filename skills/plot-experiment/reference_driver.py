@@ -38,6 +38,8 @@ COULTER_DIR  = Path(r"C:\path\to\<...>_coulter_sample_annotation")   # Coulter (
 OUT_ROOT = COMPILED_DIR.parent if COMPILED_DIR else COULTER_DIR.parent
 FIG_DIR  = OUT_ROOT / f"{EXP_NAME}_fig"
 PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_figures.pptx"
+# Claude writes OUT_ROOT / f"{EXP_NAME}_analysis_notes.md" next to the deck (data structure +
+# plotting choices) so a future dataset can be analyzed the same way.
 
 # Paired runs use the matched pair_ block (pair_mass_pg, pair_volume_fl, pair_cell_density_g_per_mL
 # — density is already absolute, computed by the hdf5 pipeline itself); mass-only / volume-only

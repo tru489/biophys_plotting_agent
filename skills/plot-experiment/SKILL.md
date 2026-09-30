@@ -7,7 +7,8 @@ description: >-
   <exp>", or a directory containing a `*_compiled/experiment_data.xlsx` (iFXM) or a
   `*_coulter_sample_annotation/metadata.csv` (Coulter). Inspects the experiment's annotation schema (conditions,
   drugs, time points), generates a short plotting driver from the bundled toolkit, runs it, and
-  shows the figures for fine-tuning.
+  shows the figures for fine-tuning. Also triggers on "plot this like <past experiment>" — reads
+  the past analysis's `*_analysis_notes.md` to recapitulate that analysis on a new dataset.
 ---
 
 # Plot a compiled biophysics experiment
@@ -26,8 +27,20 @@ Bundled files (reference via `${CLAUDE_PLUGIN_ROOT}/skills/plot-experiment/`):
   → `build_plan`/`render_plan`/`autoplot` → pptx.
 - `reference_driver.py` — the driver template you adapt.
 - `references/data_schema.md` — the exact xlsx/csv/metadata schema + role table. **Read it first.**
+- `references/analysis_notes_template.md` — outline for the per-analysis notes file (step 6).
 
 ## Procedure
+
+### 0. Reusing a past analysis (only when the user points to one)
+If the user asks to analyze a new dataset "like" a past one and points at a past analysis dir (or
+its dataset dir), find its `*_analysis_notes.md` (next to the `*_figures.pptx`) and read it, plus
+the driver it names. Use it as the starting point for steps 1–3: same properties, grouping axes,
+`ROLE_OVERRIDES`, `GRID_PAIRS`, scatter pairs, outlier rejection and customizations — mapped onto
+the new dataset's columns. Still run steps 1–2 on the new data: inspect its metadata, and in the
+plan you present call out every difference from the past analysis (renamed/missing/new columns,
+different levels, a grid that's no longer crossed) and what you propose for each. Anything the
+notes flag as experiment-specific gets re-decided with the user, not copied. If there's no notes
+file, fall back to the past driver alone and say so.
 
 ### 1. Locate & inspect the input
 The loaders read the **raw** biophys_helpers outputs directly (no reorg step). Find whichever the
@@ -154,7 +167,8 @@ A conda env spec is bundled at `${CLAUDE_PLUGIN_ROOT}/environment.yaml`
 Run the driver. It writes PNGs to `<exp>_fig/` (see the naming grid in `data_schema.md`:
 `{datatype}_{metric}_{plottype}_{col}={value}.png`, `..._by_{col}.png`,
 `{datatype}_{propY}_vs_{propX}[_{col}={value}].png`, `{datatype}_{prop}_heatmap_{colX}-x-{colY}.png`)
-plus `<exp>_figures.pptx` (with `<exp>` the dated analysis dir name).
+plus `<exp>_figures.pptx` (with `<exp>` the dated analysis dir name). You then write
+`<exp>_analysis_notes.md` beside the pptx (step 6).
 
 **Point counts (automatic):** every ridge row shows its `n=` (number of points plotted) in small
 gray text just outside the right edge of the axes, and every box shows its `n=` just above its
@@ -186,6 +200,18 @@ directly in Claude Code (`ROLE_OVERRIDES`, which columns to group/compare/cross,
 box-tick labeling via `compare_groups`/`cross_groups`'s `label_exclude=` if the automatic
 "don't restate the title/bold-separator" rule above needs a different set excluded for some
 column) and re-run — the copied toolkit makes it fully editable.
+
+### 6. Write the analysis notes (always, alongside the pptx)
+Every time the skill produces a pptx, write `<EXP_NAME>_analysis_notes.md` **in the same dir as
+`<EXP_NAME>_figures.pptx`**, following `references/analysis_notes_template.md`. Its purpose: a
+future run pointed at this analysis (step 0) can read it and recapitulate the analysis on a new
+dataset. Keep it short and factual — only the data-structure details that drive the plotting:
+inputs and sample counts (paired / unpaired), each annotation column with its role, levels and
+any override, how the columns relate (crossed grid, independent, repeated controls, missing
+combos), which plots/axes/pairs were made, and every non-default choice (outlier rejection, axis
+limits, excluded samples, palettes, hand-rolled figures). No prose about results. When the user
+fine-tunes and you re-run, update the notes to match the final driver — they must never describe
+an older state.
 
 ## Outlier rejection (opt-in — the loaders never trim data)
 
