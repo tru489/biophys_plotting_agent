@@ -97,6 +97,12 @@ come from that matched subset (unchanged behavior); the standalone `mass_`/`vol_
 share **one** mask (row-aligned) on `pair_volume_fl`; in the distribution loader (`load_ifxm`) each
 prop is gated and cleaned independently.
 
+**Per-cell run time (paired records only).** `pair_` rows carry no timestamp, and
+`pair_mass_cell_index` does **not** index the (filtered) `mass_` block. `load_ifxm_paired` therefore
+matches each paired cell to the `mass_` row with the identical `mass_pg` value and takes its
+`mass_peak_time_h` (hours since run start), stored row-aligned as `record["time_h"]` (NaN if there's
+no match or the mass value is ambiguous). Used by `props_vs_time`.
+
 ### Density is always absolute — no baseline to supply
 
 `density` is `pair_cell_density_g_per_mL` directly — already absolute, computed by the hdf5
@@ -163,6 +169,7 @@ Figures go to `<exp>_fig/`; the deck to `<exp>_figures.pptx`. File names:
 {datatype}_{propY}_vs_{propX}[_{col}={slug(value)}].png   # per-cell scatter + marginals
 {datatype}_{prop}_{kind}_by_{colA}-x-{colB}.png    # cross_groups (crossing on request)
 {datatype}_{prop}_heatmap_{colX}-x-{colY}.png      # grid_heatmap (grid search, user-confirmed)
+{datatype}_{prop1-prop2-...}_vs_time_{slug(sample)}.png  # props_vs_time (per sample, on request)
 ```
 
 - `datatype` ∈ {`coulter`, `ifxm`}

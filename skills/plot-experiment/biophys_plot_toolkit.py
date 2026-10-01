@@ -348,6 +348,23 @@ def _gate_clean(a, mask):
     return a[np.isfinite(a)]
 
 
+_MASS_TIME = "peak_time_h"   # MASS block per-cell run time (h since run start) -> 'mass_peak_time_h'
+
+
+def _pair_time_h(massblk, pair_mass) -> np.ndarray:
+    """Per-cell run time (h) for the PAIRED rows. pair_ rows carry no timestamp and
+    pair_mass_cell_index does not index the (filtered) mass_ block, so each paired cell is matched
+    to the mass_ row with the identical mass value and takes its peak time. Cells with no match, or
+    whose mass value is shared by several mass_ rows (ambiguous), get NaN."""
+    t = np.full(pair_mass.size, np.nan)
+    if massblk is None or _MASS_STANDALONE not in massblk or _MASS_TIME not in massblk:
+        return t
+    mm = massblk[[_MASS_STANDALONE, _MASS_TIME]].dropna()
+    mm = mm[~mm[_MASS_STANDALONE].duplicated(keep=False)]
+    lookup = pd.Series(mm[_MASS_TIME].to_numpy(float), index=mm[_MASS_STANDALONE].to_numpy(float))
+    return lookup.reindex(pair_mass).to_numpy(float)
+
+
 def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                        normalizers, paired):
     """Shared iFXM reader. `paired`=True keeps all props row-aligned under one mask from the PAIRED
@@ -400,6 +417,10 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                         "density": dens[mask],
                         "vol":     vol[mask],
                     }
+                    t = _pair_time_h(_read_block(xls, xlsx, r[skey], "mass", cache), mass)
+                    recs.append({"sample": sample, "props": props, "meta": meta_bag,
+                                 "time_h": t[mask]})
+                    continue
                 else:
                     bm_mask = np.isfinite(mass) & (mass >= bm_lo) & (mass <= bm_hi)
                     ix_mask = np.isfinite(vol) & (vol >= ix_lo) & (vol <= ix_hi)
@@ -464,8 +485,10 @@ def load_ifxm_paired(compiled_dir, *, sample_col="sample_name",
                      ifxm_upper_col="ifxm_gate_upper", normalizers=VALUE_NORMALIZERS) -> list:
     """Like load_ifxm, but keeps per-cell arrays row-ALIGNED across properties (one shared mask from
     the PAIRED block: pair_mass_pg, pair_volume_fl, pair_cell_density_g_per_mL), so a cell's mass /
-    density / volume stay paired. Use for scatter_by. Only samples with a paired block appear
-    (unpaired mass-only / volume-only samples are skipped — there is nothing to correlate)."""
+    density / volume stay paired. Use for scatter_by / props_vs_time. Only samples with a paired
+    block appear (unpaired mass-only / volume-only samples are skipped — nothing to correlate).
+    Each record also carries `time_h`: per-cell run time (h since run start), row-aligned with the
+    props, taken from the mass_ block's peak_time_h (NaN where it can't be matched)."""
     return _load_ifxm_records(
         compiled_dir, sample_col, sheet_col,
         (bm_lower_col, bm_upper_col, ifxm_lower_col, ifxm_upper_col), normalizers, paired=True)
@@ -554,7 +577,8 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
     scope  : 'per_sample' (bounds from each sample's own values; default) or 'pooled' (bounds from
              every cell of that prop across all records — one global cutoff).
     paired : True for row-aligned records (load_ifxm_paired): a keep-mask is built from each
-             selected prop, AND-combined, and applied to EVERY prop so a cell's props stay aligned.
+             selected prop, AND-combined, and applied to EVERY prop (and the per-cell `time_h`) so
+             a cell's values stay aligned.
     log    : compute bounds in log-space (for log-normal mass/volume).
     params : method params applied globally (merged over the method defaults). For different params
              per prop, call reject_outliers once per props subset.
@@ -599,6 +623,9 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
                 newprops[p] = a[keep] if a.size == length else a
             if verbose:
                 print(f"  reject[{r['sample']}] paired: {length - int(keep.sum())}/{length} rows")
+            if "time_h" in r and np.asarray(r["time_h"]).size == length:
+                out.append({**r, "props": newprops, "time_h": np.asarray(r["time_h"])[keep]})
+                continue
         else:
             for p in sel:
                 a = np.asarray(r["props"].get(p, []), float)
@@ -1312,6 +1339,71 @@ def scatter_by(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir, *, gr
         gtitle = f" — {value_label(group_col, gval, roles)}" if group_col is not None else ""
         fig.suptitle(f"{datatype} {prop_y} vs {prop_x}{gtitle}", fontsize=11)
         _save(fig, f"{datatype}_{prop_y}_vs_{prop_x}{gsuffix}.png", fig_dir)
+
+
+def _time_trend(t, y, trend, bins, window):
+    """(x, y) of the trend line through a per-cell time series: 'binned_median' = median of each
+    of `bins` equal-width time bins (plotted at bin centers); 'rolling_mean' / 'rolling_median' =
+    a centered moving window of `window` consecutive cells in time order (default ~n/30, min 5)."""
+    if trend == "binned_median":
+        edges = np.linspace(t.min(), t.max(), bins + 1)
+        centers = (edges[:-1] + edges[1:]) / 2
+        idx = np.clip(np.digitize(t, edges[1:-1]), 0, bins - 1)
+        med = [np.median(y[idx == b]) if (idx == b).any() else np.nan for b in range(bins)]
+        return centers, np.asarray(med)
+    if trend in ("rolling_mean", "rolling_median"):
+        order = np.argsort(t)
+        w = window or max(5, t.size // 30)
+        roll = pd.Series(y[order]).rolling(w, center=True, min_periods=max(1, w // 2))
+        return t[order], (roll.mean() if trend == "rolling_mean" else roll.median()).to_numpy()
+    raise ValueError(f"unknown trend {trend!r} (use 'binned_median', 'rolling_mean', "
+                     f"'rolling_median', or None)")
+
+
+def props_vs_time(records, datatype, fig_dir, *, samples=None, props=("mass", "vol", "density"),
+                  prop_labels=None, trend="binned_median", bins=30, window=None,
+                  time_unit="auto", color="#0072B2") -> None:
+    """Per-cell properties vs run time within ONE sample — one figure per sample, one stacked panel
+    per prop (shared time axis): every cell as a dot plus a black trend line (see _time_trend) to
+    show drift over the run. ON REQUEST only (not in build_plan). Pass load_ifxm_paired records
+    (they carry the row-aligned per-cell `time_h`; reject_outliers(paired=True) keeps it aligned).
+    `samples`: sample names to plot (default: every record with times). `time_unit`: 'h', 'min',
+    or 'auto' (minutes when the run is under 1 h).
+    Files: {datatype}_{prop1-prop2-...}_vs_time_{slug(sample)}.png"""
+    labels = {**dict(IFXM_PROPS), **(prop_labels or {})}
+    trend_txt = {"binned_median": f"binned median ({bins} bins)",
+                 "rolling_mean": "moving average", "rolling_median": "moving median"}
+    wanted = None if samples is None else set(samples)
+    for r in records:
+        if wanted is not None and r["sample"] not in wanted:
+            continue
+        t = np.asarray(r.get("time_h", []), float)
+        ys = {p: np.asarray(r["props"].get(p, []), float) for p in props}
+        ys = {p: y for p, y in ys.items() if y.size and y.size == t.size}
+        if not t.size or not ys:
+            print(f"  props_vs_time: {r['sample']} has no per-cell times — skipped "
+                  f"(use load_ifxm_paired records)")
+            continue
+        keep = np.isfinite(t) & np.logical_and.reduce([np.isfinite(y) for y in ys.values()])
+        if keep.sum() < 2:
+            continue
+        unit = time_unit if time_unit != "auto" else ("min" if np.nanmax(t[keep]) < 1 else "h")
+        tt = t[keep] * (60 if unit == "min" else 1)
+
+        fig, axes = plt.subplots(len(ys), 1, figsize=(11, 3 * len(ys)), sharex=True, squeeze=False)
+        for ax, (p, y) in zip(axes[:, 0], ys.items()):
+            y = y[keep]
+            ax.scatter(tt, y, s=3, alpha=0.4, color=color, linewidths=0, rasterized=True)
+            if trend:
+                tx, ty = _time_trend(tt, y, trend, bins, window)
+                ax.plot(tx, ty, color="black", lw=1.8)
+            ax.set_ylabel(labels.get(p, p))
+        axes[-1, 0].set_xlabel(f"Time since run start ({unit})")
+        line = f"; black = {trend_txt.get(trend, trend)}" if trend else ""
+        axes[0, 0].set_title(f"{datatype} {r['sample']} — per-cell properties over time "
+                             f"(n={int(keep.sum())}{line})", fontsize=10, fontweight="bold")
+        fig.tight_layout()
+        _save(fig, f"{datatype}_{'-'.join(ys)}_vs_time_{_slug(r['sample'])}.png", fig_dir)
 
 
 def facet(records, prop, ylabel, datatype, fig_dir, *, facet_col, roles=None, inner="box",

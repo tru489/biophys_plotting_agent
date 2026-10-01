@@ -118,6 +118,8 @@ def main() -> None:
     #                   cols=("is_activated", "media"))   # crossing on request
     #   tk.grid_heatmap(ifxm, "density", "Density (g/mL)", "ifxm", FIG_DIR,
     #                   cols=("osm_mOsmL", "dose_uM"), show_repeats=True)   # grid search, confirmed
+    #   tk.props_vs_time(ifxm_paired, "ifxm", FIG_DIR, samples=["<sample_name>"],
+    #                    props=("mass", "vol", "density"), trend="binned_median")  # drift, on request
     #
     # Hand-rolled figures: legends must not cover the data. Draw the data first, then
     #   tk.place_legend(ax, handles=[...], loc="upper right")   # moves itself if that spot is busy
