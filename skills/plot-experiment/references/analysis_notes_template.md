@@ -25,6 +25,7 @@ future run needs to recapitulate this analysis on a new dataset. Delete sections
 - Grouping/compare axes: …; timecourse series: …; scatter pairs: …
 - `GRID_PAIRS`: `[...]` (show_repeats?) — or none
 - Cross-products (`cross_groups`), facets, hand-rolled figures: …
+- Props-vs-time deck (`<EXP_NAME>_props_vs_time.pptx`): samples, props, trend — or skipped (why)
 
 ## Customizations & data handling
 - Outlier rejection: none / `reject_outliers(...)` spec

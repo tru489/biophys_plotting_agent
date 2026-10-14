@@ -38,6 +38,10 @@ COULTER_DIR  = Path(r"C:\path\to\<...>_coulter_sample_annotation")   # Coulter (
 OUT_ROOT = COMPILED_DIR.parent if COMPILED_DIR else COULTER_DIR.parent
 FIG_DIR  = OUT_ROOT / f"{EXP_NAME}_fig"
 PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_figures.pptx"
+# Default second deck: per-sample per-cell props vs run time (drift within each run), kept in its
+# own fig dir so it doesn't mix into the main deck. iFXM paired samples only.
+TIME_FIG_DIR  = OUT_ROOT / f"{EXP_NAME}_vs_time_fig"
+TIME_PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_props_vs_time.pptx"
 # Claude writes OUT_ROOT / f"{EXP_NAME}_analysis_notes.md" next to the deck (data structure +
 # plotting choices) so a future dataset can be analyzed the same way.
 
@@ -118,14 +122,21 @@ def main() -> None:
     #                   cols=("is_activated", "media"))   # crossing on request
     #   tk.grid_heatmap(ifxm, "density", "Density (g/mL)", "ifxm", FIG_DIR,
     #                   cols=("osm_mOsmL", "dose_uM"), show_repeats=True)   # grid search, confirmed
-    #   tk.props_vs_time(ifxm_paired, "ifxm", FIG_DIR, samples=["<sample_name>"],
-    #                    props=("mass", "vol", "density"), trend="binned_median")  # drift, on request
     #
     # Hand-rolled figures: legends must not cover the data. Draw the data first, then
     #   tk.place_legend(ax, handles=[...], loc="upper right")   # moves itself if that spot is busy
     #   tk._save(fig, "my_fig.png", FIG_DIR)                    # also re-checks every legend
 
     tk.save_pptx(FIG_DIR, PPTX_OUT)
+
+    # --- Default second deck: per-cell mass/vol/density vs run time, one slide per sample ---
+    # Every paired sample; trend 'binned_median' (bins=) | 'rolling_mean' | 'rolling_median'
+    # (window=) | None. Narrow with samples=[...] / props=(...) if the user asks.
+    if ifxm_paired:
+        tk.props_vs_time(ifxm_paired, "ifxm", TIME_FIG_DIR,
+                         props=[p for p in ("mass", "vol", "density") if p in IFXM_LABELS],
+                         prop_labels=IFXM_LABELS, trend="binned_median")
+        tk.save_pptx(TIME_FIG_DIR, TIME_PPTX_OUT)
 
 
 if __name__ == "__main__":

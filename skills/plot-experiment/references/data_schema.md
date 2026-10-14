@@ -159,7 +159,9 @@ Grouping/ordering columns are chosen at plot time by passing `group_col=` / `ser
 
 `<exp>` (`EXP_NAME`) is the full analysis dir name **including its date prefix**
 (e.g. `2026-09-22_fl5_wnki_conc-curves`), so decks are `2026-09-22_fl5_wnki_conc-curves_figures.pptx`.
-Figures go to `<exp>_fig/`; the deck to `<exp>_figures.pptx`. File names:
+Figures go to `<exp>_fig/`; the deck to `<exp>_figures.pptx`. The default second deck (iFXM paired
+samples only) puts the `props_vs_time` figures in `<exp>_vs_time_fig/` and the deck in
+`<exp>_props_vs_time.pptx`. File names:
 
 ```
 {datatype}_{prop}_{kind}_{col}={slug(value)}.png   # per-group detail (kind ∈ ridge|box)
@@ -169,7 +171,7 @@ Figures go to `<exp>_fig/`; the deck to `<exp>_figures.pptx`. File names:
 {datatype}_{propY}_vs_{propX}[_{col}={slug(value)}].png   # per-cell scatter + marginals
 {datatype}_{prop}_{kind}_by_{colA}-x-{colB}.png    # cross_groups (crossing on request)
 {datatype}_{prop}_heatmap_{colX}-x-{colY}.png      # grid_heatmap (grid search, user-confirmed)
-{datatype}_{prop1-prop2-...}_vs_time_{slug(sample)}.png  # props_vs_time (per sample, on request)
+{datatype}_{prop1-prop2-...}_vs_time_{slug(sample)}.png  # props_vs_time (per sample, default; in <exp>_vs_time_fig/)
 ```
 
 - `datatype` ∈ {`coulter`, `ifxm`}

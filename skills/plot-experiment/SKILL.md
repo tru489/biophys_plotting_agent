@@ -24,7 +24,7 @@ Bundled files (reference via `${CLAUDE_PLUGIN_ROOT}/skills/plot-experiment/`):
 - `biophys_plot_toolkit.py` — the library: loaders → `infer_roles` → low-level `draw_*` →
   combinators (`plot_grouped`/`compare_groups`/`timecourse_by`/`scatter_by`/`facet`/`cross_groups`/
   `grid_heatmap`/`props_vs_time`)
-  → `build_plan`/`render_plan`/`autoplot` → pptx.
+  → `build_plan`/`render_plan`/`autoplot` → pptx (plus a default second `props_vs_time` deck).
 - `reference_driver.py` — the driver template you adapt.
 - `references/data_schema.md` — the exact xlsx/csv/metadata schema + role table. **Read it first.**
 - `references/analysis_notes_template.md` — outline for the per-analysis notes file (step 6).
@@ -147,15 +147,20 @@ loudly rather than silently falling back.
    - `grid_heatmap(cols=(x, y), show_repeats=False)` — grid-search heatmap of per-sample means
      (`agg="mean"`; repeated cells averaged), **only when the user confirmed it** (see step 2).
    - `facet(facet_col=…)` — compact one-figure grid.
-   - `props_vs_time(paired_records, "ifxm", FIG_DIR, samples=[…], props=(…), trend=…)` —
-     **on request only** (not in `build_plan`): one figure per sample of per-cell mass / vol /
-     density vs. run time (stacked panels) with a black trend line, to show drift within a run.
-     **Pass `load_ifxm_paired` records** — they carry the per-cell `time_h` (matched from the
-     mass_ block's `peak_time_h`), which `reject_outliers(paired=True)` keeps aligned. `trend`:
-     `"binned_median"` (default, `bins=30`), `"rolling_mean"` (moving average) or
-     `"rolling_median"` (`window=` cells, default ~n/30), or `None`. `samples=None` → every
-     paired sample; x-axis auto-switches to minutes for runs under 1 h (`time_unit=`). When the
-     user asks for this, confirm which samples and properties if they didn't say.
+   - `props_vs_time(paired_records, "ifxm", TIME_FIG_DIR, samples=[…], props=(…), trend=…)` —
+     **always made, as a separate default deck** (not in `build_plan`; the template runs it
+     after the main deck): one figure per paired sample of per-cell mass / vol / density vs. run
+     time (stacked panels) with a black trend line, to show drift within a run. Figures go to
+     `<exp>_vs_time_fig/` and the deck to `<exp>_props_vs_time.pptx` beside `<exp>_figures.pptx`
+     — never into the main `FIG_DIR`/deck. **Do not ask whether to make it**; keep the
+     template's block for every iFXM experiment with paired samples (skip it only if the user
+     says to). Defaults: every paired sample, mass/vol/density, `trend="binned_median"`. **Pass
+     `load_ifxm_paired` records** — they carry the per-cell `time_h` (matched from the mass_
+     block's `peak_time_h`), which `reject_outliers(paired=True)` keeps aligned, so the outlier
+     choice from step 2 applies here too. `trend`: `"binned_median"` (`bins=30`),
+     `"rolling_mean"` (moving average) or `"rolling_median"` (`window=` cells, default ~n/30), or
+     `None`. x-axis auto-switches to minutes for runs under 1 h (`time_unit=`). Narrow
+     `samples=`/`props=` or change `trend` only when the user asks.
    Keep `import biophys_plot_toolkit as tk` — do **not** inline helpers. Add the
    `reject_outliers` lines the user chose in step 2 (none if they declined); beyond that, tame a
    heavy tail with axis limits in the driver.
@@ -186,8 +191,9 @@ A conda env spec is bundled at `${CLAUDE_PLUGIN_ROOT}/environment.yaml`
 Run the driver. It writes PNGs to `<exp>_fig/` (see the naming grid in `data_schema.md`:
 `{datatype}_{metric}_{plottype}_{col}={value}.png`, `..._by_{col}.png`,
 `{datatype}_{propY}_vs_{propX}[_{col}={value}].png`, `{datatype}_{prop}_heatmap_{colX}-x-{colY}.png`,
-`{datatype}_{props}_vs_time_{sample}.png`)
-plus `<exp>_figures.pptx` (with `<exp>` the dated analysis dir name). You then write
+plus `<exp>_figures.pptx` (with `<exp>` the dated analysis dir name), and — for iFXM with paired
+samples — the per-sample `{datatype}_{props}_vs_time_{sample}.png` figures in `<exp>_vs_time_fig/`
+compiled into `<exp>_props_vs_time.pptx`. You then write
 `<exp>_analysis_notes.md` beside the pptx (step 6).
 
 **Point counts (automatic):** every ridge row shows its `n=` (number of points plotted) in small

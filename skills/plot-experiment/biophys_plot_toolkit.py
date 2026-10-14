@@ -1365,7 +1365,8 @@ def props_vs_time(records, datatype, fig_dir, *, samples=None, props=("mass", "v
                   time_unit="auto", color="#0072B2") -> None:
     """Per-cell properties vs run time within ONE sample — one figure per sample, one stacked panel
     per prop (shared time axis): every cell as a dot plus a black trend line (see _time_trend) to
-    show drift over the run. ON REQUEST only (not in build_plan). Pass load_ifxm_paired records
+    show drift over the run. Not in build_plan: the driver runs it by DEFAULT into its own fig dir
+    and deck (<exp>_vs_time_fig/ -> <exp>_props_vs_time.pptx). Pass load_ifxm_paired records
     (they carry the row-aligned per-cell `time_h`; reject_outliers(paired=True) keeps it aligned).
     `samples`: sample names to plot (default: every record with times). `time_unit`: 'h', 'min',
     or 'auto' (minutes when the run is under 1 h).
@@ -1759,12 +1760,15 @@ def autoplot(records, plan, datatype, fig_dir, prop_labels=None, paired_records=
 def save_pptx(fig_dir, out_path) -> None:
     """Compile every PNG in fig_dir into a 16:9 deck, one image per slide (centered, aspect-fit).
     The deck name should start with the analysis dir's date (e.g. '2026-09-22_<exp>_figures.pptx')
-    — a warning is printed if it doesn't."""
+    — a warning is printed if it doesn't. No PNGs (or no fig_dir) -> no deck is written."""
     from PIL import Image as PILImage
     from pptx import Presentation
     from pptx.util import Inches, Emu
 
     fig_dir, out_path = Path(fig_dir), Path(out_path)
+    if not any(fig_dir.glob("*.png")):
+        print(f"  no figures in {fig_dir.name} — {out_path.name} not written")
+        return
     if not re.match(r"\d{4}-?\d{2}-?\d{2}", out_path.name):
         print(f"  WARNING: {out_path.name} has no date prefix — set EXP_NAME to the full analysis "
               f"dir name (e.g. '2026-09-22_<exp>')")
