@@ -86,16 +86,18 @@ Derived properties, and where the loader sources each:
 
 | prop key  | paired sample                                | unpaired sample (mass-only / volume-only)                          | gate        | units |
 |-----------|-----------------------------------------------|----------------------------------------------------------------------|-------------|-------|
-| `mass`    | `pair_mass_pg`                                 | `mass_mass_pg` (full SMR distribution)                                | `bm_gate`   | pg    |
-| `density` | `pair_cell_density_g_per_mL` (already absolute) | — (empty; density **requires pairing**)                              | `ifxm_gate` | g/mL  |
-| `vol`     | `pair_volume_fl` (always present)              | `vol_volume_fL` if calibrated, else `vol_volume_au` (full FXM distribution) | `ifxm_gate` | fL (or AU if uncalibrated) |
+| `mass`    | `pair_mass_pg`                                 | `mass_mass_pg` (full SMR distribution)                                | paired: `bm_gate` AND `ifxm_gate`; unpaired: `bm_gate` | pg    |
+| `density` | `pair_cell_density_g_per_mL` (already absolute) | — (empty; density **requires pairing**)                              | `bm_gate` AND `ifxm_gate` | g/mL  |
+| `vol`     | `pair_volume_fl` (always present)              | `vol_volume_fL` if calibrated, else `vol_volume_au` (full FXM distribution) | paired: `bm_gate` AND `ifxm_gate`; unpaired: `ifxm_gate` | fL (or AU if uncalibrated) |
 
 **Paired-primary, standalone-fallback**: when a sample has a `pair_` block, marginal `mass`/`vol`
 come from that matched subset (unchanged behavior); the standalone `mass_`/`vol_` blocks are used
 **only** when there is no `pair_` block at all. `scatter_by` (via `load_ifxm_paired`) uses the
-`pair_` block only, so unpaired samples never appear in scatters. In the paired loader the props
-share **one** mask (row-aligned) on `pair_volume_fl`; in the distribution loader (`load_ifxm`) each
-prop is gated and cleaned independently.
+`pair_` block only, so unpaired samples never appear in scatters. **Gating is ex ante and joint**:
+in both loaders, a paired sample's props share **one** row-aligned mask: `bm_gate` on
+`pair_mass_pg` AND `ifxm_gate` on `pair_volume_fl`, all three finite. Every plot of that sample
+therefore shows the same cells. Only an unpaired sample's standalone `mass_` / `vol_` blocks are
+each gated on their own gate.
 
 **Per-cell run time (paired records only).** `pair_` rows carry no timestamp, and
 `pair_mass_cell_index` does **not** index the (filtered) `mass_` block. `load_ifxm_paired` therefore

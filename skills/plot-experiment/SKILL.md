@@ -105,8 +105,10 @@ before running it; never skip the question even if the user already approved the
 Behavior to convey: **every** boolean/categorical/approved-ordered column becomes its own grouping
 axis (no cardinality cap — everything is plotted; reorganize on a later pass). Multiple columns are
 handled **independently** by default; cross-products are available on request via `cross_groups`. A
-time column orders samples sequentially and drives timecourses. Gate columns still apply; missing
-gate → no cutoff; unpaired samples without a volume reading get an empty `vol`.
+time column orders samples sequentially and drives timecourses. Gate columns always apply, **ex
+ante**: a paired cell must pass both the mass (`bm_gate`) and volume (`ifxm_gate`) gates before it
+reaches any plot (ridge, box, timecourse, heatmap, scatter, props-vs-time). Missing gate → no
+cutoff; unpaired samples without a volume reading get an empty `vol`.
 
 **Unpaired runs are supported.** A paired sample uses its matched `pair_` block (unchanged); a
 **mass-only** run (`mass` only) or **volume-only** run (`vol` only) falls back to the standalone
@@ -249,9 +251,9 @@ records feeding straight into `build_plan`/`autoplot`/any combinator, so one cal
 downstream plot. Step 2 always asks the user whether to use it (recommended default: Tukey fences,
 per sample, on mass/volume/density):
 ```python
-ifxm        = tk.reject_outliers(ifxm, method="iqr", props=["mass", "density", "vol"], scope="per_sample")
 ifxm_paired = tk.reject_outliers(ifxm_paired, method="iqr", props=["mass", "density", "vol"],
-                                 scope="per_sample", paired=True)                      # scatter
+                                 scope="per_sample", paired=True, bounds_from=ifxm)    # scatter
+ifxm        = tk.reject_outliers(ifxm, method="iqr", props=["mass", "density", "vol"], scope="per_sample")
 coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"], scope="per_sample")
 ```
 (Trim `props` to the properties that exist.)
@@ -272,22 +274,27 @@ enumerating the full spec, then wire the answer into the driver. Ask for:
 
 Then add lines to the driver (and re-run):
 ```python
-ifxm        = tk.reject_outliers(ifxm, method={"density": "mad", "mass": "iqr"}, scope="per_sample")
-ifxm_paired = tk.reject_outliers(ifxm_paired, method="mad", props=["density"], paired=True)  # scatter
+spec = dict(method={"density": "mad", "mass": "iqr"}, scope="per_sample")
+ifxm_paired = tk.reject_outliers(ifxm_paired, **spec, paired=True, bounds_from=ifxm)  # scatter
+ifxm        = tk.reject_outliers(ifxm, **spec)
 coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"])
 ```
-Notes: apply to the **scatter** records (`ifxm_paired`) with `paired=True` so a cell's props stay
-row-aligned; for the distribution records use the plain call. `verbose=True` prints how many cells
+Notes: clean the **scatter** records (`ifxm_paired`) with the same spec, `paired=True` (a cell's
+props stay row-aligned) and `bounds_from=<untrimmed ifxm>`, so scatters use exactly the cutoffs
+of the ridges/boxes. Clean them before reassigning `ifxm`. A paired cell is still dropped from
+scatters if *any* of its props falls outside its cutoff, which keeps the rows aligned. `verbose=True` prints how many cells
 each sample dropped. Low-level keep-masks (`tk.outlier_mask`, `keep_mad`/`keep_iqr`/`keep_percentile`)
 are exposed for bespoke logic. (k-sigma/3-std is intentionally not built in — ask if the user wants it.)
 
 ## Gotchas
-- **iFXM gating**: `mass` uses `bm_gate`; `density`/`vol` share one mask on `pair_volume_fl` (the
-  paired sample's volume). No statistical outlier rejection is applied by the loaders — only
-  non-finite values are dropped (trimming is the driver's `reject_outliers` call, asked every run). `load_ifxm`
-  gates mass and the volume props with separate masks (so per-property arrays can differ in
-  length); `load_ifxm_paired` uses one shared mask to keep arrays row-aligned — always use it for
-  `scatter_by` (and pass `paired_records=` to `autoplot`), or a scatter's x/y won't pair.
+- **iFXM gating (ex ante, joint)**: for a paired sample, both loaders apply ONE mask to every prop:
+  `bm_gate` on `pair_mass_pg` AND `ifxm_gate` on `pair_volume_fl` (and all three props finite).
+  So every plot of a paired sample, whether ridge, box, heatmap or scatter, shows the same gated
+  cells. Only unpaired (mass-only / volume-only) samples gate each standalone block on its own
+  gate, because their cells aren't matched. No statistical outlier rejection is applied by the
+  loaders (trimming is the driver's `reject_outliers` call, asked every run). Still use
+  `load_ifxm_paired` for `scatter_by` / `props_vs_time` (and pass `paired_records=` to
+  `autoplot`): it skips unpaired samples and carries the per-cell `time_h`.
 - **A pair_ block must carry all three columns** — `pair_mass_pg`, `pair_volume_fl`,
   `pair_cell_density_g_per_mL`. `load_ifxm`/`load_ifxm_paired` raise a clear error naming the
   sample if any are missing, rather than silently dropping data. This is the only paired format.

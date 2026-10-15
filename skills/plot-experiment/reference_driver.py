@@ -77,20 +77,23 @@ def main() -> None:
     coulter = tk.load_coulter(COULTER_DIR) if COULTER_DIR else []
     ifxm = ifxm_paired = []
     if COMPILED_DIR:
+        # Both loaders gate ex ante: a paired cell must pass the mass AND volume gates to appear in
+        # any plot, so a paired sample has the same cells in both.
         ifxm = tk.load_ifxm(COMPILED_DIR)
-        # row-aligned variant for scatter (keeps a cell's props paired under one shared gate mask)
+        # row-aligned variant for scatter / props-vs-time (same cells, plus per-cell time_h)
         ifxm_paired = tk.load_ifxm_paired(COMPILED_DIR)
     print(f"  coulter samples: {len(coulter)} | ifxm samples: {len(ifxm)}")
 
     # --- Outlier rejection (Claude asks each run; data is loaded verbatim otherwise) -------
     # Recommended default: Tukey fences, per sample, on mass/density/vol (+ coulter volume). One
     # call cleans every downstream plot. method 'mad'|'iqr'|'percentile' (per-prop dict allowed);
-    # scope 'per_sample'|'pooled'; log=True for log-normal mass/volume. Use paired=True on the
-    # scatter records to keep rows aligned. Delete these lines if the user declines.
+    # scope 'per_sample'|'pooled'; log=True for log-normal mass/volume. Clean the paired records
+    # with paired=True (rows stay aligned) and bounds_from=<untrimmed ifxm> (same cutoffs as the
+    # ridges/boxes) — so clean them BEFORE reassigning `ifxm`. Delete these lines if declined.
+    #   ifxm_paired = tk.reject_outliers(ifxm_paired, method="iqr", props=["mass", "density", "vol"],
+    #                                    scope="per_sample", paired=True, bounds_from=ifxm)
     #   ifxm        = tk.reject_outliers(ifxm, method="iqr", props=["mass", "density", "vol"],
     #                                    scope="per_sample")
-    #   ifxm_paired = tk.reject_outliers(ifxm_paired, method="iqr", props=["mass", "density", "vol"],
-    #                                    scope="per_sample", paired=True)
     #   coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"], scope="per_sample")
 
     # --- iFXM: inspect the annotation schema, show the plan, run it -----------------------

@@ -34,8 +34,10 @@ The loaders read the RAW biophys_helpers outputs directly (no reorg step):
             is empty there). scatter (load_ifxm_paired) uses paired samples only.
 
 No statistical outlier rejection is applied anywhere — the loaders drop only non-finite (NaN/inf)
-values. The only intentional data exclusions are the metadata-driven gates (bm_gate / ifxm_gate)
-and samples skipped because they lack a paired ('pair_') block.
+values. The only intentional data exclusions are the metadata-driven gates and samples skipped
+because they lack a paired ('pair_') block. Gates are applied ex ante, before any processing or
+plot: a paired cell must pass BOTH bm_gate (mass) and ifxm_gate (volume) to appear anywhere
+(ridge, box, timecourse, heatmap, scatter, props-vs-time).
 """
 import re
 import numpy as np
@@ -367,11 +369,12 @@ def _pair_time_h(massblk, pair_mass) -> np.ndarray:
 
 def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                        normalizers, paired):
-    """Shared iFXM reader. `paired`=True keeps all props row-aligned under one mask from the PAIRED
-    block (for scatter); unpaired samples are skipped. `paired`=False builds distribution props:
-    from the PAIRED block when present (matched subset — unchanged), else falling back to the
-    standalone MASS / VOLUME blocks so mass-only and volume-only runs still load (density stays
-    pairing-only)."""
+    """Shared iFXM reader. A PAIRED-block sample is gated ex ante with one joint mask (mass within
+    bm_gate AND volume within ifxm_gate, all three props finite) applied to every prop, whichever
+    loader is used, so its distribution and scatter cells are identical. `paired`=True also attaches
+    `time_h` and skips unpaired samples. `paired`=False falls back, for samples without a PAIRED
+    block, to the standalone MASS / VOLUME blocks (each gated on its own gate, since those cells
+    aren't matched) so mass-only and volume-only runs still load (density stays pairing-only)."""
     bm_lo_c, bm_hi_c, ix_lo_c, ix_hi_c = gate_cols
     xlsx = _open_ifxm_xlsx(compiled_dir)
     recs = []
@@ -407,30 +410,25 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                 vol  = pair[_PAIR_VOL].to_numpy(dtype=float)
                 dens = pair[_PAIR_DENS].to_numpy(dtype=float)
 
+                # ONE mask for every prop, in both loaders: a cell must pass the mass (bm) AND the
+                # volume (ifxm) gate to appear in any plot. Keeps the props row-aligned, and makes
+                # the distribution and scatter records hold exactly the same cells.
+                mask = (np.isfinite(mass) & np.isfinite(dens) & np.isfinite(vol)
+                        & (mass >= bm_lo) & (mass <= bm_hi)
+                        & (vol >= ix_lo) & (vol <= ix_hi))
+                props = {
+                    "mass":    mass[mask],
+                    "density": dens[mask],
+                    "vol":     vol[mask],
+                }
                 if paired:
-                    # single mask over all three props keeps them length-matched & row-aligned
-                    mask = (np.isfinite(mass) & np.isfinite(dens) & np.isfinite(vol)
-                            & (mass >= bm_lo) & (mass <= bm_hi)
-                            & (vol >= ix_lo) & (vol <= ix_hi))
-                    props = {
-                        "mass":    mass[mask],
-                        "density": dens[mask],
-                        "vol":     vol[mask],
-                    }
                     t = _pair_time_h(_read_block(xls, xlsx, r[skey], "mass", cache), mass)
                     recs.append({"sample": sample, "props": props, "meta": meta_bag,
                                  "time_h": t[mask]})
                     continue
-                else:
-                    bm_mask = np.isfinite(mass) & (mass >= bm_lo) & (mass <= bm_hi)
-                    ix_mask = np.isfinite(vol) & (vol >= ix_lo) & (vol <= ix_hi)
-                    props = {
-                        "mass":    _gate_clean(mass, bm_mask),
-                        "density": _gate_clean(dens, ix_mask),
-                        "vol":     _gate_clean(vol, ix_mask),
-                    }
             else:
                 # Unpaired sample (mass-only / volume-only): fall back to the standalone blocks.
+                # Their cells aren't matched, so each block can only take its own gate.
                 massblk = _read_block(xls, xlsx, r[skey], "mass", cache)
                 volblk  = _read_block(xls, xlsx, r[skey], "vol", cache)
                 if massblk is None and volblk is None:
@@ -464,7 +462,8 @@ def load_ifxm(compiled_dir, *, sample_col="sample_name",
     """Load iFXM distribution data from a '*_compiled/' dir's experiment_data.xlsx.
 
     For each sample (worksheet named by `sheet_col`): if it has a PAIRED ('pair_') block, mass /
-    density / vol come from that matched subset (mass bm-gated; density/vol ifxm-gated on volume) —
+    density / vol come from that matched subset, keeping only cells that pass BOTH the bm (mass)
+    and ifxm (volume) gates — the same cells load_ifxm_paired returns —
     pair_mass_pg (pg), pair_volume_fl (already-calibrated fL), and pair_cell_density_g_per_mL
     (ABSOLUTE density, computed by the hdf5 pipeline itself). A pair_ block missing any of those
     three columns raises — every paired sample must carry all three. If a sample has NO paired block
@@ -566,7 +565,7 @@ def keep_percentile(a, lower=1.0, upper=99.0, *, log=False, ref=None):
 
 
 def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="per_sample",
-                    log=False, params=None, verbose=False) -> list:
+                    log=False, params=None, bounds_from=None, verbose=False) -> list:
     """Return NEW records with outliers removed from the selected props. OPT-IN — nothing is
     trimmed unless you call this; the returned list feeds straight into build_plan / autoplot /
     any combinator, so one call cleans every downstream plot.
@@ -582,6 +581,10 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
     log    : compute bounds in log-space (for log-normal mass/volume).
     params : method params applied globally (merged over the method defaults). For different params
              per prop, call reject_outliers once per props subset.
+    bounds_from : records to compute the cutoffs from instead of `records` (matched by sample for
+             'per_sample'; all of them for 'pooled'). Pass the UNTRIMMED load_ifxm records when
+             cleaning the paired records, so scatters use exactly the ridge/box cutoffs. A sample
+             missing from bounds_from falls back to its own values.
     verbose: print how many cells/rows each sample dropped (rejection is never silent).
 
     Records are copied (never mutated); `meta` is preserved.
@@ -595,12 +598,24 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
     def meth(p):
         return method[p] if isinstance(method, dict) else method
 
+    ref_recs = records if bounds_from is None else bounds_from
+    ref_by_sample = {r["sample"]: r for r in ref_recs}
     pooled_ref = {}
     if scope == "pooled":
         for p in sel:
-            arrs = [np.asarray(r["props"].get(p, []), float) for r in records]
+            arrs = [np.asarray(r["props"].get(p, []), float) for r in ref_recs]
             arrs = [a for a in arrs if a.size]
             pooled_ref[p] = np.concatenate(arrs) if arrs else np.array([])
+
+    def ref_for(r, p):
+        """Reference values for r's prop p (None = r's own values)."""
+        if scope == "pooled":
+            return pooled_ref.get(p)
+        if bounds_from is None:
+            return None
+        src = ref_by_sample.get(r["sample"])
+        a = np.asarray(src["props"].get(p, []), float) if src else _EMPTY
+        return a if a.size else None
 
     out = []
     for r in records:
@@ -616,8 +631,7 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
                 a = np.asarray(r["props"].get(p, []), float)
                 if a.size != length:
                     continue  # e.g. empty vol (unpaired mass-only sample) — don't break the joint mask
-                ref = pooled_ref.get(p) if scope == "pooled" else None
-                keep &= outlier_mask(a, meth(p), log=log, ref=ref, **kw)
+                keep &= outlier_mask(a, meth(p), log=log, ref=ref_for(r, p), **kw)
             for p, a in r["props"].items():
                 a = np.asarray(a, float)
                 newprops[p] = a[keep] if a.size == length else a
@@ -631,8 +645,7 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
                 a = np.asarray(r["props"].get(p, []), float)
                 if a.size == 0:
                     continue
-                ref = pooled_ref.get(p) if scope == "pooled" else None
-                keep = outlier_mask(a, meth(p), log=log, ref=ref, **kw)
+                keep = outlier_mask(a, meth(p), log=log, ref=ref_for(r, p), **kw)
                 newprops[p] = a[keep]
                 if verbose:
                     print(f"  reject[{r['sample']}] {p} ({meth(p)}): "
