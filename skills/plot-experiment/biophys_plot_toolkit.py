@@ -1085,8 +1085,23 @@ def draw_timecourse(ax, series: dict, colors: dict, xlabel, ylabel) -> None:
     place_legend(ax)
 
 
-def draw_scatter_marginal(fig, subplot_spec, x, y, color, xlabel, ylabel, title) -> None:
-    """A per-cell scatter with marginal histograms (x on top, y on right), inside subplot_spec."""
+def _span_limits(arrays, pad=0.03):
+    """(lo, hi) covering every finite value in `arrays`, padded by `pad` of the range — so a
+    figure's panels can share limits without clipping any point. None if there are no values."""
+    vals = np.concatenate([np.asarray(a, float).ravel() for a in arrays]) if arrays else _EMPTY
+    vals = vals[np.isfinite(vals)]
+    if not vals.size:
+        return None
+    lo, hi = float(vals.min()), float(vals.max())
+    d = (hi - lo) * pad or (abs(lo) * pad or 1.0)
+    return lo - d, hi + d
+
+
+def draw_scatter_marginal(fig, subplot_spec, x, y, color, xlabel, ylabel, title, *,
+                          xlim=None, ylim=None) -> None:
+    """A per-cell scatter with marginal histograms (x on top, y on right), inside subplot_spec.
+    `xlim` / `ylim` fix the axes (and span the histogram bins over them, so panels sharing limits
+    also share bins); None autoscales to this panel's points."""
     inner = gridspec.GridSpecFromSubplotSpec(
         2, 2, subplot_spec=subplot_spec, width_ratios=[3, 1], height_ratios=[1, 3],
         hspace=0.03, wspace=0.03)
@@ -1096,8 +1111,13 @@ def draw_scatter_marginal(fig, subplot_spec, x, y, color, xlabel, ylabel, title)
     fig.add_subplot(inner[0, 1]).axis("off")
 
     ax_sc.scatter(x, y, color=color, s=2, alpha=0.3, linewidths=0)
-    ax_xh.hist(x, bins=30, color=color, alpha=0.7)
-    ax_yh.hist(y, bins=30, orientation="horizontal", color=color, alpha=0.7)
+    ax_xh.hist(x, bins=np.linspace(*xlim, 31) if xlim else 30, color=color, alpha=0.7)
+    ax_yh.hist(y, bins=np.linspace(*ylim, 31) if ylim else 30, orientation="horizontal",
+               color=color, alpha=0.7)
+    if xlim:
+        ax_sc.set_xlim(xlim)
+    if ylim:
+        ax_sc.set_ylim(ylim)
 
     plt.setp(ax_xh.get_xticklabels(), visible=False)
     plt.setp(ax_yh.get_yticklabels(), visible=False)
@@ -1285,7 +1305,8 @@ def scatter_by(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir, *, gr
     """Per-cell scatter of prop_y vs prop_x with marginal histograms — a grid of per-sample panels.
     One figure per value of `group_col` (or a single figure if group_col is None). Panels colored
     by `color_col` (defaults to group_col). Pass records from load_ifxm_paired so x and y are
-    row-aligned. Files: {datatype}_{prop_y}_vs_{prop_x}[_{group_col}={slug(value)}].png"""
+    row-aligned. All panels in a figure share one x and one y range, set to cover every panel's
+    points (nothing is clipped). Files: {datatype}_{prop_y}_vs_{prop_x}[_{group_col}={slug(value)}].png"""
     roles = roles or infer_roles(records)
     color_col = color_col or group_col
     colors = color_map_for(records, color_col, roles) if color_col else {}
@@ -1325,13 +1346,17 @@ def scatter_by(records, prop_x, prop_y, xlabel, ylabel, datatype, fig_dir, *, gr
         n = len(sub)
         nc = min(n, ncols)
         nrows = int(np.ceil(n / nc))
+        # One x and one y range per figure, spanning every panel's points: panels are directly
+        # comparable and no point is clipped.
+        xlim = _span_limits([x for _, (x, _y) in sub])
+        ylim = _span_limits([y for _, (_x, y) in sub])
         fig = plt.figure(figsize=(nc * 3.5, nrows * 3.5))
         outer = gridspec.GridSpec(nrows, nc, figure=fig, hspace=0.55, wspace=0.45)
         for idx, (r, (x, y)) in enumerate(sub):
             ri, ci = divmod(idx, nc)
             c = colors.get(rget(r, color_col), FALLBACK_COLOR) if color_col else FALLBACK_COLOR
             draw_scatter_marginal(fig, outer[ri, ci], x, y, c, xlabel, ylabel,
-                                  _detail_label(r, roles, time_col))
+                                  _detail_label(r, roles, time_col), xlim=xlim, ylim=ylim)
         for idx in range(n, nrows * nc):
             ri, ci = divmod(idx, nc)
             fig.add_subplot(outer[ri, ci]).axis("off")

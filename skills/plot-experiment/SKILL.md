@@ -142,7 +142,9 @@ loudly rather than silently falling back.
      and ridge.
    - `timecourse_by(time_col=…, series_col=…)` — unit-aware, sequentially ordered.
    - `scatter_by(prop_x, prop_y, group_col=…)` — per-cell scatter + marginals; **pass
-     `load_ifxm_paired` records** (row-aligned).
+     `load_ifxm_paired` records** (row-aligned). All panels in one figure share x/y limits that
+     span every panel's points. Keep that rule in any hand-rolled scatter grid (`tk._span_limits`
+     + `draw_scatter_marginal(..., xlim=, ylim=)`): no per-panel autoscaling, no clipping.
    - `cross_groups(cols=(a, b))` — cross-product comparison, on request.
    - `grid_heatmap(cols=(x, y), show_repeats=False)` — grid-search heatmap of per-sample means
      (`agg="mean"`; repeated cells averaged), **only when the user confirmed it** (see step 2).
