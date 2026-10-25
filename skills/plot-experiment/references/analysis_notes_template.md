@@ -9,6 +9,12 @@ future run needs to recapitulate this analysis on a new dataset. Delete sections
 - Coulter: `<...>_coulter_sample_annotation/` — N samples
 - Driver: `<driver>.py` (+ copied `biophys_plot_toolkit.py`), plugin version X.Y.Z
 
+## Cells per sample
+<!-- Paste the driver's printed render_cell_counts table(s) (same as the deck's first slide). Note
+any sample with has_gate = False (compiled ungated) or an unusually large drop. -->
+| Sample | Cells from | Before gating | After gating | After outlier rejection: mass | … |
+|---|---|---|---|---|---|
+
 ## Annotation columns → roles
 | column | role | levels / range | notes |
 |--------|------|----------------|-------|

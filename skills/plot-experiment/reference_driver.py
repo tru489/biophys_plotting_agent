@@ -77,8 +77,8 @@ def main() -> None:
     coulter = tk.load_coulter(COULTER_DIR) if COULTER_DIR else []
     ifxm = ifxm_paired = []
     if COMPILED_DIR:
-        # Both loaders gate ex ante: a paired cell must pass the mass AND volume gates to appear in
-        # any plot, so a paired sample has the same cells in both.
+        # Cells arrive already gated by compile_experiment.py (AND of every gate; older xlsx files
+        # are gated by the loaders instead), so a paired sample has the same cells in both.
         ifxm = tk.load_ifxm(COMPILED_DIR)
         # row-aligned variant for scatter / props-vs-time (same cells, plus per-cell time_h)
         ifxm_paired = tk.load_ifxm_paired(COMPILED_DIR)
@@ -110,7 +110,7 @@ def main() -> None:
         croles = tk.infer_roles(coulter, overrides=ROLE_OVERRIDES)
         cplan = tk.build_plan(coulter, "coulter", roles=croles, props=list(COULTER_LABELS),
                               grid_pairs=GRID_PAIRS)
-        print(tk.render_plan(cplan))
+        print(tk.render_plan(cplan))      # includes the per-sample cell-count table
         tk.autoplot(coulter, cplan, "coulter", FIG_DIR, prop_labels=COULTER_LABELS)
 
     # --- Explicit combinators (comment out autoplot above and drive it yourself) ----------
@@ -130,7 +130,12 @@ def main() -> None:
     #   tk.place_legend(ax, handles=[...], loc="upper right")   # moves itself if that spot is busy
     #   tk._save(fig, "my_fig.png", FIG_DIR)                    # also re-checks every legend
 
-    tk.save_pptx(FIG_DIR, PPTX_OUT)
+    # First slide(s): per-sample cell counts before gating / after gating / after outlier rejection,
+    # from the same records the ridges and boxes used. Copy the printed tables into the notes.
+    count_tables = {label: recs for label, recs in (("iFXM", ifxm), ("Coulter", coulter)) if recs}
+    for label, recs in count_tables.items():
+        print(tk.render_cell_counts(recs, title=f"Cells per sample — {label}"))
+    tk.save_pptx(FIG_DIR, PPTX_OUT, count_tables=count_tables)
 
     # --- Default second deck: per-cell mass/vol/density vs run time, one slide per sample ---
     # Every paired sample; trend 'binned_median' (bins=) | 'rolling_mean' | 'rolling_median'

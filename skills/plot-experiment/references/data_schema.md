@@ -54,16 +54,23 @@ used by the toolkit:
 | `sheet_name`                    | **worksheet name** for this sample (Excel-legal, ≤31 chars, sanitized) — how the loaders find the sample's data sheet |
 | `hdf5_key`                      | key into `images.h5` only (**not** the data sheet key)        |
 | `condition`, `time_h`, `drug_name` (optional) | hand-added annotation columns, same meaning as Coulter |
-| `bm_gate_lower`, `bm_gate_upper`| buoyant-mass (pg) gate for `mass` (NaN when no gate)          |
-| `ifxm_gate_lower`, `ifxm_gate_upper` | volume gate on **uncalibrated** volume (NaN when no gate) |
-| `has_mass`, `has_volume`, `has_pairing`, `has_bm_gate`, `has_ifxm_gate`, `has_images`, `coulter_column`, `calibration_factor` | availability flags / provenance |
+| `gate_<attr>_lower`, `gate_<attr>_upper` | bounds of each gate already applied by `compile_experiment.py`, `<attr>` ∈ `mass_pg`, `baseline_norm`, `bl_slope`, `node_dev_mean`, `volume_fl` (NaN = not gated) — informational, the loaders don't re-apply them |
+| `has_gate`                      | False = sample had no gate file and was compiled **ungated**   |
+| `n_<block>_ungated`, `n_<block>_gated` | cells in each block (`mass`, `paired`, `volume`) before / after gating; feed the cell-count tables |
+| `has_mass`, `has_volume`, `has_pairing`, `has_images`, `coulter_column`, `calibration_factor` | availability flags / provenance |
+| legacy: `bm_gate_lower/upper`, `ifxm_gate_lower/upper`, `has_bm_gate`, `has_ifxm_gate` | older xlsx files only — blocks were written ungated, so the loaders gate with these (mass gate on `mass`, volume gate on `vol`) |
+
+The loaders tell the two formats apart by the presence of `has_gate` / any `gate_*` column.
 
 Each sample's worksheet (looked up by `sheet_name`) holds up to **three side-by-side blocks**
 separated by one blank spacer column, distinguished by a column-name prefix:
 
-- `vol_*` — every FXM cell (unpaired): `vol_transit_index`, `vol_volume_au`, `vol_volume_fL`
-  (fL only when calibrated).
+- `vol_*` — every FXM cell (unpaired), written only for samples with no `pair_` block: currently
+  the CELLGROUPED hdf5's `analysis/volume/cells` table (`vol_cell_id`, `vol_volume_fl` —
+  calibrated fL — plus pass-through columns); legacy files have `vol_volume_au` / `vol_volume_fL`.
 - `mass_*` — every SMR cell (unpaired): `mass_mass_pg` (+ any pass-through columns from the mass CSV).
+
+Every block holds only gated cells (current files); see the metadata table above.
 - `pair_*` — **matched cells, row-aligned per cell**, straight from a `*_CELLGROUPED.hdf5`'s
   `analysis/density/cells` table (current SMRFXMAnalysis output; the only paired format), filtered
   to `status_code == 'ok'` and mirrored essentially verbatim: `pair_cell_id`, `pair_mass_pg` (pg),
@@ -84,20 +91,28 @@ truncated in the sheet; the loaders prefer the overflow CSV when present.
 
 Derived properties, and where the loader sources each:
 
-| prop key  | paired sample                                | unpaired sample (mass-only / volume-only)                          | gate        | units |
+| prop key  | paired sample                                | unpaired sample (mass-only / volume-only)                          | legacy-file gate (current files: gated upstream) | units |
 |-----------|-----------------------------------------------|----------------------------------------------------------------------|-------------|-------|
 | `mass`    | `pair_mass_pg`                                 | `mass_mass_pg` (full SMR distribution)                                | paired: `bm_gate` AND `ifxm_gate`; unpaired: `bm_gate` | pg    |
 | `density` | `pair_cell_density_g_per_mL` (already absolute) | — (empty; density **requires pairing**)                              | `bm_gate` AND `ifxm_gate` | g/mL  |
-| `vol`     | `pair_volume_fl` (always present)              | `vol_volume_fL` if calibrated, else `vol_volume_au` (full FXM distribution) | paired: `bm_gate` AND `ifxm_gate`; unpaired: `ifxm_gate` | fL (or AU if uncalibrated) |
+| `vol`     | `pair_volume_fl` (always present)              | `vol_volume_fl` (current) or legacy `vol_volume_fL`, else `vol_volume_au` | paired: `bm_gate` AND `ifxm_gate`; unpaired: `ifxm_gate` | fL (or AU if uncalibrated) |
 
 **Paired-primary, standalone-fallback**: when a sample has a `pair_` block, marginal `mass`/`vol`
 come from that matched subset (unchanged behavior); the standalone `mass_`/`vol_` blocks are used
 **only** when there is no `pair_` block at all. `scatter_by` (via `load_ifxm_paired`) uses the
-`pair_` block only, so unpaired samples never appear in scatters. **Gating is ex ante and joint**:
-in both loaders, a paired sample's props share **one** row-aligned mask: `bm_gate` on
-`pair_mass_pg` AND `ifxm_gate` on `pair_volume_fl`, all three finite. Every plot of that sample
-therefore shows the same cells. Only an unpaired sample's standalone `mass_` / `vol_` blocks are
-each gated on their own gate.
+`pair_` block only, so unpaired samples never appear in scatters. **Gating is upstream**:
+`compile_experiment.py` writes each block already filtered to the AND of every gate, and in both
+loaders a paired sample's props share **one** row-aligned mask (all three finite), so every plot
+of that sample shows the same cells. For legacy files the loaders add the gates to that mask
+(`bm_gate` on `pair_mass_pg` AND `ifxm_gate` on `pair_volume_fl`; an unpaired sample's standalone
+`mass_` / `vol_` blocks each on their own gate).
+
+**Cell counts.** Every record carries `cell_counts` — per source block, cells before gating
+(`n_<block>_ungated`, or the raw block length for legacy files; `None` for Coulter) and after
+gating (as loaded). `reject_outliers` keeps it and appends its spec to `outlier_rejection`.
+`tk.cell_count_rows(records)` / `tk.render_cell_counts(records)` turn that into the per-sample
+table (before gating / after gating / after outlier rejection per prop) used in the plan, the
+notes and the deck's first slide(s) (`save_pptx(..., count_tables={"iFXM": ifxm, ...})`).
 
 **Per-cell run time (paired records only).** `pair_` rows carry no timestamp, and
 `pair_mass_cell_index` does **not** index the (filtered) `mass_` block. `load_ifxm_paired` therefore
@@ -126,7 +141,7 @@ carried into each record's `meta` bag, and `infer_roles(records)` classifies eve
 | `categorical`| other strings (any cardinality — no cap)                | per-value plots + comparison + facet |
 | `continuous` | high-cardinality numeric, no gradient hint              | color / scatter axis only      |
 | `label`      | `sample_name` / unique free text                        | labels only                    |
-| `structural` | `sheet_name`, `hdf5_key`, `has_*`, `*_gate_*`, `coulter_column`, `calibration_factor` | ignored |
+| `structural` | `sheet_name`, `hdf5_key`, `has_*`, `gate_*`, `n_(mass\|paired\|volume)_(un)gated`, legacy `*_gate_*`, `coulter_column`, `calibration_factor` | ignored |
 
 Notes:
 - **Booleans** (checkbox columns are literally `yes`/`no`) get the high-contrast, colorblind-safe
@@ -151,11 +166,11 @@ Loaders no longer take per-role column args (role assignment is downstream). The
 | loader | args |
 |--------|------|
 | `load_coulter(coulter_dir, …)` | `sample_col="sample_name"`, `data_file=None` (override data-CSV auto-locate), `normalizers=VALUE_NORMALIZERS` |
-| `load_ifxm` / `load_ifxm_paired(compiled_dir, …)` | `sample_col`, `sheet_col="sheet_name"` (falls back to sample), `bm_lower_col`/`bm_upper_col`/`ifxm_lower_col`/`ifxm_upper_col`, `normalizers` |
+| `load_ifxm` / `load_ifxm_paired(compiled_dir, …)` | `sample_col`, `sheet_col="sheet_name"` (falls back to sample), `bm_lower_col`/`bm_upper_col`/`ifxm_lower_col`/`ifxm_upper_col` (legacy files only), `normalizers` |
 
 Grouping/ordering columns are chosen at plot time by passing `group_col=` / `series_col=` /
-`facet_col=` / `time_col=` (or letting `build_plan` pick them from the inferred roles). Missing gate
-→ unbounded (no cutoff); a missing grouping column just means no plots for it.
+`facet_col=` / `time_col=` (or letting `build_plan` pick them from the inferred roles). In a legacy
+file, a missing gate → unbounded (no cutoff); a missing grouping column just means no plots for it.
 
 ## Output naming grid
 

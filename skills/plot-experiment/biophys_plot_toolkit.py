@@ -34,10 +34,14 @@ The loaders read the RAW biophys_helpers outputs directly (no reorg step):
             is empty there). scatter (load_ifxm_paired) uses paired samples only.
 
 No statistical outlier rejection is applied anywhere — the loaders drop only non-finite (NaN/inf)
-values. The only intentional data exclusions are the metadata-driven gates and samples skipped
-because they lack a paired ('pair_') block. Gates are applied ex ante, before any processing or
-plot: a paired cell must pass BOTH bm_gate (mass) and ifxm_gate (volume) to appear anywhere
-(ridge, box, timecourse, heatmap, scatter, props-vs-time).
+values. Gating happens UPSTREAM: compile_experiment.py writes each block already filtered to the
+AND of every gate in the sample's gate file (mass_pg, baseline_norm, bl_slope, node_dev_mean,
+volume_fl), so every plot (ridge, box, timecourse, heatmap, scatter, props-vs-time) shows only
+gated cells and the loaders don't gate again. Older xlsx files (bm_gate_* / ifxm_gate_* metadata
+columns, ungated blocks) are still gated here, the old way: a paired cell must pass BOTH bm_gate
+(mass) and ifxm_gate (volume). Each record carries `cell_counts` (cells before / after gating), and
+reject_outliers tags what it did, so cell_count_rows / render_cell_counts / save_pptx can report
+the per-sample cell counts at every stage.
 """
 import re
 import numpy as np
@@ -234,7 +238,8 @@ def color_map_for(records, col, roles=None, base=None):
 #                       cell_density_g_per_mL (ABSOLUTE density, computed by the hdf5 pipeline
 #                       itself from its own media_density_g_per_mL).
 #   MASS   ('mass_')  — every SMR cell (unpaired): mass_pg (+ pass-through mass_* columns).
-#   VOLUME ('vol_')   — every FXM cell (unpaired): volume_au, volume_fL.
+#   VOLUME ('vol_')   — every FXM cell (unpaired): volume_fl (current, CELLGROUPED hdf5's
+#                       calibrated volume), or legacy volume_au / volume_fL.
 # Density is pairing-only; the standalone blocks never carry it.
 _PAIR_MASS = "mass_pg"                # buoyant mass (pg)
 _PAIR_VOL  = "volume_fl"              # already-calibrated volume (fL) -> single `vol` prop
@@ -244,8 +249,10 @@ _PAIR_DENS = "cell_density_g_per_mL"  # ABSOLUTE density (g/mL)
 # The VOLUME block can carry a calibrated (fL) and/or uncalibrated (AU) reading; both feed the
 # single `vol` prop, preferring calibrated fL when both are present.
 _MASS_STANDALONE = "mass_pg"    # MASS block buoyant mass (pg)   -> 'mass_mass_pg' on the sheet
-_VOL_UNCAL = "volume_au"        # VOLUME block uncalibrated (AU) -> 'vol_volume_au'
-_VOL_CAL   = "volume_fL"        # VOLUME block calibrated (fL)   -> 'vol_volume_fL' (if calibrated)
+_VOL_UNCAL = "volume_au"        # legacy VOLUME block uncalibrated (AU) -> 'vol_volume_au'
+# Calibrated (fL) VOLUME column, in preference order: current CELLGROUPED-hdf5 'vol_volume_fl',
+# then the legacy *_ProcessedVolumes 'vol_volume_fL'.
+_VOL_CALS  = ("volume_fl", "volume_fL")
 
 
 def _find_coulter_data_csv(d: Path, meta_path: Path) -> Path:
@@ -302,6 +309,8 @@ def load_coulter(coulter_dir, *, sample_col="sample_name", data_file=None,
             "sample": sample,
             "props":  {"volume": arr},
             "meta":   _build_meta(r, sample, normalizers),
+            # Coulter data is gated upstream with no pre-gate count recorded -> ungated None.
+            "cell_counts": [_cell_count("coulter", None, arr.size, ["volume"])],
         })
     return recs
 
@@ -367,14 +376,37 @@ def _pair_time_h(massblk, pair_mass) -> np.ndarray:
     return lookup.reindex(pair_mass).to_numpy(float)
 
 
+def _cell_count(block, ungated, gated, props) -> dict:
+    """One `cell_counts` entry: which block a record's `props` came from, its cell count before
+    gating (None = not recorded) and after gating (as loaded), and the props it feeds."""
+    return {"block": block, "ungated": None if ungated is None else int(ungated),
+            "gated": int(gated), "props": list(props)}
+
+
+def _upstream_gated(meta) -> bool:
+    """True for an xlsx from the consolidated-gate compile_experiment.py (has_gate /
+    gate_<attr>_lower|upper metadata columns): its blocks already hold only cells passing every
+    gate, so the loaders must not gate again."""
+    return "has_gate" in meta.columns or any(str(c).startswith("gate_") for c in meta.columns)
+
+
+def _meta_count(row, col):
+    """An n_<block>_ungated count from the metadata row as int, or None if absent/NaN."""
+    v = _get_float(row, col, np.nan)
+    return int(v) if np.isfinite(v) else None
+
+
 def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                        normalizers, paired):
-    """Shared iFXM reader. A PAIRED-block sample is gated ex ante with one joint mask (mass within
-    bm_gate AND volume within ifxm_gate, all three props finite) applied to every prop, whichever
-    loader is used, so its distribution and scatter cells are identical. `paired`=True also attaches
-    `time_h` and skips unpaired samples. `paired`=False falls back, for samples without a PAIRED
-    block, to the standalone MASS / VOLUME blocks (each gated on its own gate, since those cells
-    aren't matched) so mass-only and volume-only runs still load (density stays pairing-only)."""
+    """Shared iFXM reader. Current xlsx files are gated upstream by compile_experiment.py (AND of
+    every gate, on every block), so cells are taken as written, dropping only non-finite values.
+    Older xlsx files without that (bm_gate_* / ifxm_gate_* columns, ungated blocks) are gated here:
+    a PAIRED-block sample with one joint mask (mass within bm_gate AND volume within ifxm_gate),
+    standalone blocks each on their own gate. Either way a paired sample's props share one
+    row-aligned mask (all three finite), so its distribution and scatter cells are identical.
+    `paired`=True also attaches `time_h` and skips unpaired samples. `paired`=False falls back, for
+    samples without a PAIRED block, to the standalone MASS / VOLUME blocks so mass-only and
+    volume-only runs still load (density stays pairing-only). Every record carries `cell_counts`."""
     bm_lo_c, bm_hi_c, ix_lo_c, ix_hi_c = gate_cols
     xlsx = _open_ifxm_xlsx(compiled_dir)
     recs = []
@@ -382,6 +414,7 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
         meta = pd.read_excel(xls, sheet_name="metadata")
         _require_col(meta, sample_col, "sample-name")
         skey = sheet_col if sheet_col in meta.columns else sample_col
+        pregated = _upstream_gated(meta)
         cache = {}
 
         for _, r in meta.iterrows():
@@ -398,21 +431,31 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
             if paired and not has_pair:
                 continue  # scatter needs a paired block; unpaired samples have no row-aligned pairs
 
-            bm_lo = _gate_bound(r, bm_lo_c, -np.inf)
-            bm_hi = _gate_bound(r, bm_hi_c,  np.inf)
-            ix_lo = _gate_bound(r, ix_lo_c, -np.inf)
-            ix_hi = _gate_bound(r, ix_hi_c,  np.inf)
+            if pregated:
+                # Already gated upstream: no cutoffs here (only the finite checks below).
+                bm_lo = ix_lo = -np.inf
+                bm_hi = ix_hi = np.inf
+            else:
+                bm_lo = _gate_bound(r, bm_lo_c, -np.inf)
+                bm_hi = _gate_bound(r, bm_hi_c,  np.inf)
+                ix_lo = _gate_bound(r, ix_lo_c, -np.inf)
+                ix_hi = _gate_bound(r, ix_hi_c,  np.inf)
             sample = _get(r, sample_col, "")
             meta_bag = _build_meta(r, sample, normalizers)
+
+            def _ungated(block, n_rows):
+                # Upstream-gated files record the pre-gate count; legacy files are gated here,
+                # so the block's own row count is the pre-gate count.
+                return _meta_count(r, f"n_{block}_ungated") if pregated else n_rows
 
             if has_pair:
                 mass = pair[_PAIR_MASS].to_numpy(dtype=float)
                 vol  = pair[_PAIR_VOL].to_numpy(dtype=float)
                 dens = pair[_PAIR_DENS].to_numpy(dtype=float)
 
-                # ONE mask for every prop, in both loaders: a cell must pass the mass (bm) AND the
-                # volume (ifxm) gate to appear in any plot. Keeps the props row-aligned, and makes
-                # the distribution and scatter records hold exactly the same cells.
+                # ONE mask for every prop, in both loaders. Keeps the props row-aligned, and makes
+                # the distribution and scatter records hold exactly the same cells. (Legacy files
+                # only: the mass (bm) AND volume (ifxm) gates are applied here too.)
                 mask = (np.isfinite(mass) & np.isfinite(dens) & np.isfinite(vol)
                         & (mass >= bm_lo) & (mass <= bm_hi)
                         & (vol >= ix_lo) & (vol <= ix_hi))
@@ -421,14 +464,16 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                     "density": dens[mask],
                     "vol":     vol[mask],
                 }
+                counts = [_cell_count("paired", _ungated("paired", mass.size), mask.sum(),
+                                      ["mass", "density", "vol"])]
                 if paired:
                     t = _pair_time_h(_read_block(xls, xlsx, r[skey], "mass", cache), mass)
                     recs.append({"sample": sample, "props": props, "meta": meta_bag,
-                                 "time_h": t[mask]})
+                                 "time_h": t[mask], "cell_counts": counts})
                     continue
             else:
                 # Unpaired sample (mass-only / volume-only): fall back to the standalone blocks.
-                # Their cells aren't matched, so each block can only take its own gate.
+                # Their cells aren't matched, so (legacy files) each block takes only its own gate.
                 massblk = _read_block(xls, xlsx, r[skey], "mass", cache)
                 volblk  = _read_block(xls, xlsx, r[skey], "vol", cache)
                 if massblk is None and volblk is None:
@@ -436,13 +481,13 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
 
                 mass = massblk[_MASS_STANDALONE].to_numpy(dtype=float) \
                     if massblk is not None and _MASS_STANDALONE in massblk.columns else _EMPTY
-                # Single `vol` prop: prefer the calibrated (fL) reading, else the uncalibrated (AU) one.
-                if volblk is not None and _VOL_CAL in volblk.columns:
-                    vol = volblk[_VOL_CAL].to_numpy(dtype=float)
-                elif volblk is not None and _VOL_UNCAL in volblk.columns:
-                    vol = volblk[_VOL_UNCAL].to_numpy(dtype=float)
-                else:
-                    vol = _EMPTY
+                # Single `vol` prop: prefer a calibrated (fL) reading, else the uncalibrated (AU) one.
+                vol = _EMPTY
+                if volblk is not None:
+                    for c in (*_VOL_CALS, _VOL_UNCAL):
+                        if c in volblk.columns:
+                            vol = volblk[c].to_numpy(dtype=float)
+                            break
 
                 bm_mask = np.isfinite(mass) & (mass >= bm_lo) & (mass <= bm_hi)
                 ix_mask = np.isfinite(vol) & (vol >= ix_lo) & (vol <= ix_hi)
@@ -451,7 +496,15 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                     "density": _EMPTY,               # density requires pairing
                     "vol":     _gate_clean(vol, ix_mask),
                 }
-            recs.append({"sample": sample, "props": props, "meta": meta_bag})
+                counts = []
+                if mass.size:
+                    counts.append(_cell_count("mass", _ungated("mass", mass.size),
+                                              props["mass"].size, ["mass"]))
+                if vol.size:
+                    counts.append(_cell_count("volume", _ungated("volume", vol.size),
+                                              props["vol"].size, ["vol"]))
+            recs.append({"sample": sample, "props": props, "meta": meta_bag,
+                         "cell_counts": counts})
     return recs
 
 
@@ -461,9 +514,11 @@ def load_ifxm(compiled_dir, *, sample_col="sample_name",
               normalizers=VALUE_NORMALIZERS) -> list:
     """Load iFXM distribution data from a '*_compiled/' dir's experiment_data.xlsx.
 
-    For each sample (worksheet named by `sheet_col`): if it has a PAIRED ('pair_') block, mass /
-    density / vol come from that matched subset, keeping only cells that pass BOTH the bm (mass)
-    and ifxm (volume) gates — the same cells load_ifxm_paired returns —
+    Cells are already gated by compile_experiment.py (the AND of every gate in the sample's gate
+    file); older xlsx files carrying bm_gate_* / ifxm_gate_* columns are gated here instead (the
+    gate-column kwargs only apply to those). For each sample (worksheet named by `sheet_col`): if it
+    has a PAIRED ('pair_') block, mass / density / vol come from that matched subset — the same
+    cells load_ifxm_paired returns —
     pair_mass_pg (pg), pair_volume_fl (already-calibrated fL), and pair_cell_density_g_per_mL
     (ABSOLUTE density, computed by the hdf5 pipeline itself). A pair_ block missing any of those
     three columns raises — every paired sample must carry all three. If a sample has NO paired block
@@ -471,7 +526,8 @@ def load_ifxm(compiled_dir, *, sample_col="sample_name",
     are used instead — `mass` from the full SMR distribution and/or `vol` from the full FXM
     distribution (calibrated fL preferred, else uncalibrated AU), with `density` empty (density
     requires pairing). Samples with no tabular iFXM data are skipped. Every metadata column is
-    carried into each record's `meta`.
+    carried into each record's `meta`, and `cell_counts` records each block's cells before / after
+    gating (see cell_count_rows).
     """
     return _load_ifxm_records(
         compiled_dir, sample_col, sheet_col,
@@ -495,7 +551,7 @@ def load_ifxm_paired(compiled_dir, *, sample_col="sample_name",
 
 # ---------------------------------------------------------------------------
 # Outlier rejection — OPT-IN. The loaders NEVER call these; the data is loaded verbatim (only
-# non-finite values + metadata gates removed). Call reject_outliers yourself, per experiment or
+# non-finite values removed, plus the gates for legacy xlsx files). Call reject_outliers yourself, per experiment or
 # per sample, to trim distributions for visualization. Each method derives keep-bounds (lo, hi)
 # from a reference array, so 'per_sample' vs 'pooled' is the same code with a different reference.
 # ---------------------------------------------------------------------------
@@ -587,7 +643,9 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
              missing from bounds_from falls back to its own values.
     verbose: print how many cells/rows each sample dropped (rejection is never silent).
 
-    Records are copied (never mutated); `meta` is preserved.
+    Records are copied (never mutated); `meta` and `cell_counts` are preserved, and each output
+    record's `outlier_rejection` list gains a one-line description of this call (shown under the
+    cell-count tables).
     """
     if not records:
         return records
@@ -597,6 +655,10 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
 
     def meth(p):
         return method[p] if isinstance(method, dict) else method
+
+    desc = (", ".join(f"{p}: {meth(p)}" for p in sel) + f"; {scope}"
+            + ("; log-space" if log else "")
+            + (f"; {', '.join(f'{k}={v}' for k, v in kw.items())}" if kw else ""))
 
     ref_recs = records if bounds_from is None else bounds_from
     ref_by_sample = {r["sample"]: r for r in ref_recs}
@@ -620,6 +682,7 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
     out = []
     for r in records:
         newprops = dict(r["props"])
+        r = {**r, "outlier_rejection": [*r.get("outlier_rejection", []), desc]}
         if paired:
             length = next((np.asarray(r["props"][p], float).size for p in sel
                            if np.asarray(r["props"].get(p, []), float).size), None)
@@ -658,8 +721,11 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
 # Role inference — classify each metadata column so plots can be chosen intelligently
 # ---------------------------------------------------------------------------
 DEFAULT_STRUCTURAL = {"sheet_name", "hdf5_key", "coulter_column", "calibration_factor"}
-STRUCTURAL_PATTERNS = [re.compile(p) for p in (r"^has_", r"_gate_lower$", r"_gate_upper$",
-                                               r"^bm_gate", r"^ifxm_gate")]
+STRUCTURAL_PATTERNS = [re.compile(p) for p in (
+    r"^has_",
+    r"^gate_",                                 # gate_<attr>_lower / _upper (compile_experiment)
+    r"^n_(mass|paired|volume)_(un)?gated$",    # per-block cell counts before / after gating
+    r"_gate_lower$", r"_gate_upper$", r"^bm_gate", r"^ifxm_gate")]   # legacy gate columns
 IDENTITY_COLS = {"sample_name"}
 
 _TIME_NAME = re.compile(r"(?i)(^|_)(t|time|elapsed)(_|$)")
@@ -1668,6 +1734,61 @@ def grid_heatmap(records, prop, label, datatype, fig_dir, *, cols, roles=None, a
 
 
 # ---------------------------------------------------------------------------
+# Cell counts per sample — before gating / after gating / after outlier rejection
+# ---------------------------------------------------------------------------
+def cell_count_rows(records) -> list:
+    """One row per (sample, source block): {sample, block, ungated, gated, after: {prop: n},
+    rejection: [descriptions]}. `ungated` / `gated` come from the loader's `cell_counts`
+    (ungated None = not recorded, e.g. Coulter); `after` is each prop's current cell count, i.e.
+    what is plotted once reject_outliers has run (equal to `gated` if it hasn't). Pass the same
+    records that feed the ridge / box plots."""
+    rows = []
+    for r in records:
+        counts = r.get("cell_counts") or [
+            _cell_count("—", None, max((np.asarray(a).size for a in r["props"].values()),
+                                       default=0), list(r["props"]))]
+        for c in counts:
+            rows.append({"sample": r["sample"], "block": c["block"], "ungated": c["ungated"],
+                         "gated": c["gated"],
+                         "after": {p: int(np.asarray(r["props"].get(p, [])).size)
+                                   for p in c["props"]},
+                         "rejection": list(r.get("outlier_rejection", []))})
+    return rows
+
+
+def _count_table(rows):
+    """(header, body, caption) for cell_count_rows output — shared by the markdown and pptx
+    renderers. One 'after outlier rejection' column per prop present."""
+    props = list(dict.fromkeys(p for row in rows for p in row["after"]))
+    fmt = lambda n: "—" if n is None else f"{n:,}"
+    header = (["Sample", "Cells from", "Before gating", "After gating"]
+              + [f"After outlier rejection: {p}" for p in props])
+    body = [[str(row["sample"]), row["block"], fmt(row["ungated"]), fmt(row["gated"])]
+            + [fmt(row["after"].get(p)) for p in props] for row in rows]
+    specs = list(dict.fromkeys(s for row in rows for s in row["rejection"]))
+    caption = ("Outlier rejection: " + " | ".join(specs)) if specs else \
+        "No outlier rejection applied — those columns equal the gated counts."
+    if any(row["ungated"] is None for row in rows):
+        caption += "  '—' = pre-gate count not recorded."
+    return header, body, caption
+
+
+def render_cell_counts(records, title="Cells per sample") -> str:
+    """Markdown table of per-sample cell counts before gating, after gating, and after outlier
+    rejection (per prop), with a caption naming the rejection applied. For the plan shown to the
+    user (pass reject_outliers(...) output to preview a proposed rejection) and the analysis notes."""
+    rows = cell_count_rows(records)
+    if not rows:
+        return ""
+    header, body, caption = _count_table(rows)
+    lines = [f"{title}:", "| " + " | ".join(header) + " |",
+             "|" + "|".join("---" for _ in header) + "|"]
+    lines += ["| " + " | ".join(cells) + " |" for cells in body]
+    lines.append(caption)
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # High-level: infer a plot plan, show it, execute it
 # ---------------------------------------------------------------------------
 def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
@@ -1681,7 +1802,8 @@ def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
     or {"cols": (x, y), "show_repeats": True, ...} (extra keys go to grid_heatmap). Grid-like
     column pairs found by suggest_grids but not in grid_pairs are listed under
     'grid_suggestions' for render_plan to offer — never plotted by default. Returns
-    {roles, props, plots:[{fn,prop,kwargs,rationale}], grid_suggestions}."""
+    {roles, props, plots:[{fn,prop,kwargs,rationale}], grid_suggestions, cell_counts} — the last
+    being render_cell_counts(records), which render_plan prints."""
     roles = roles or infer_roles(records)
     present = {k for r in records for k, v in r["props"].items() if len(v) > 0}
     props = [p for p in (props if props is not None else present) if p in present]
@@ -1724,7 +1846,8 @@ def build_plan(records, datatype, *, roles=None, props=None, scatter_pairs=None,
                           "rationale": f"grid heatmap {kw['cols'][0]} × {kw['cols'][1]}"})
     suggestions = [s for s in suggest_grids(records, roles)
                    if frozenset(s["cols"]) not in confirmed]
-    return {"roles": roles, "props": props, "plots": plots, "grid_suggestions": suggestions}
+    return {"roles": roles, "props": props, "plots": plots, "grid_suggestions": suggestions,
+            "cell_counts": render_cell_counts(records)}
 
 
 def render_plan(plan) -> str:
@@ -1759,6 +1882,9 @@ def render_plan(plan) -> str:
                     for (a, b), n in s["repeats"].items())
             lines.append(f"  - {x} × {y}: {nx}×{ny} grid, {s['filled']}/{nx * ny} combos "
                          f"filled{rep}")
+    if plan.get("cell_counts"):
+        lines.append("")
+        lines.append(plan["cell_counts"])
     return "\n".join(lines)
 
 
@@ -1795,10 +1921,65 @@ def autoplot(records, plan, datatype, fig_dir, prop_labels=None, paired_records=
 # ---------------------------------------------------------------------------
 # PowerPoint export
 # ---------------------------------------------------------------------------
-def save_pptx(fig_dir, out_path) -> None:
+_COUNT_ROWS_PER_SLIDE = 15
+
+
+def _add_count_slides(prs, layout, label, records) -> int:
+    """Cell-count table slide(s) for one dataset: a row per sample, columns before gating / after
+    gating / after outlier rejection per prop. Long sample lists continue on extra slides."""
+    from pptx.enum.text import PP_ALIGN
+    from pptx.util import Inches, Pt
+
+    rows = cell_count_rows(records)
+    if not rows:
+        return 0
+    header, body, caption = _count_table(rows)
+    chunks = [body[i:i + _COUNT_ROWS_PER_SLIDE] for i in range(0, len(body), _COUNT_ROWS_PER_SLIDE)]
+    margin, width = Inches(0.4), prs.slide_width - Inches(0.8)
+    for k, chunk in enumerate(chunks, 1):
+        slide = prs.slides.add_slide(layout)
+        title = f"Cells per sample — {label}" + (f" ({k}/{len(chunks)})" if len(chunks) > 1 else "")
+        tb = slide.shapes.add_textbox(margin, Inches(0.25), width, Inches(0.6)).text_frame
+        tb.text = title
+        tb.paragraphs[0].runs[0].font.size = Pt(24)
+        tb.paragraphs[0].runs[0].font.bold = True
+
+        n_rows = len(chunk) + 1
+        table = slide.shapes.add_table(n_rows, len(header), margin, Inches(1.0), width,
+                                       Inches(0.32) * n_rows).table
+        sample_w = Inches(3.4)
+        other_w = int((width - sample_w) / (len(header) - 1))
+        table.columns[0].width = sample_w
+        for j in range(1, len(header)):
+            table.columns[j].width = other_w
+        for i, cells in enumerate([header] + chunk):
+            for j, text in enumerate(cells):
+                cell = table.cell(i, j)
+                cell.text = text
+                para = cell.text_frame.paragraphs[0]
+                for run in para.runs:
+                    run.font.size = Pt(11 if i else 10)
+                    run.font.bold = i == 0
+                if j >= 2 and i:
+                    para.alignment = PP_ALIGN.RIGHT
+
+        cap = slide.shapes.add_textbox(margin, prs.slide_height - Inches(0.75), width,
+                                       Inches(0.5)).text_frame
+        cap.word_wrap = True
+        cap.text = caption
+        cap.paragraphs[0].runs[0].font.size = Pt(11)
+    return len(chunks)
+
+
+def save_pptx(fig_dir, out_path, count_tables=None) -> None:
     """Compile every PNG in fig_dir into a 16:9 deck, one image per slide (centered, aspect-fit).
     The deck name should start with the analysis dir's date (e.g. '2026-09-22_<exp>_figures.pptx')
-    — a warning is printed if it doesn't. No PNGs (or no fig_dir) -> no deck is written."""
+    — a warning is printed if it doesn't. No PNGs (or no fig_dir) -> no deck is written.
+
+    count_tables: optional {label: records} (e.g. {"iFXM": ifxm, "Coulter": coulter}, the records
+    that fed the ridge / box plots, after any reject_outliers). Each becomes a table slide at the
+    START of the deck — a row per sample: cells before gating, after gating, and after outlier
+    rejection per prop (more than 15 samples continue on extra slides)."""
     from PIL import Image as PILImage
     from pptx import Presentation
     from pptx.util import Inches, Emu
@@ -1815,6 +1996,8 @@ def save_pptx(fig_dir, out_path) -> None:
     prs.slide_width, prs.slide_height = slide_w, slide_h
     blank_layout = prs.slide_layouts[6]
 
+    n_tables = sum(_add_count_slides(prs, blank_layout, label, recs)
+                   for label, recs in (count_tables or {}).items() if recs)
     pngs = sorted(fig_dir.glob("*.png"))
     for png in pngs:
         img_w, img_h = PILImage.open(png).size
@@ -1828,4 +2011,5 @@ def save_pptx(fig_dir, out_path) -> None:
         slide.shapes.add_picture(str(png), left=left, top=top, width=w, height=h)
 
     prs.save(str(out_path))
-    print(f"  saved {out_path.name} ({len(pngs)} slides)")
+    print(f"  saved {out_path.name} ({n_tables + len(pngs)} slides"
+          + (f", {n_tables} cell-count table" if n_tables else "") + ")")

@@ -69,13 +69,22 @@ exist** and classifies each into a **role** via `tk.infer_roles(records)`:
 | `ordered` | numeric gradient (e.g. `dose_uM`, `passage`) — **flagged `[CONFIRM]`** | ordered grouping/comparison (after you confirm) |
 | `continuous` | high-cardinality numeric | color/scatter axis only |
 | `label` | `sample_name` / free-text identity | labels only |
-| `structural` | `sheet_name`, `hdf5_key`, `has_*`, `*_gate_*`, … | ignored |
+| `structural` | `sheet_name`, `hdf5_key`, `has_*`, `gate_*`, `n_<block>_(un)gated`, legacy `*_gate_*`, … | ignored |
 
 Do this: load the records, run `infer_roles`, build a plan with `tk.build_plan(...)`, and **show
 the user `tk.render_plan(plan)`** — the role of every column, any `[CONFIRM]` gradient guesses, and
 the list of proposed plots. **Always present this and get approval/overrides before generating the
 driver** (this is a hard requirement). The user resolves `[CONFIRM]` columns and can re-map
 anything via `overrides={col: "ordered"|"categorical"|...}`.
+
+**Cell counts — always in the plan.** `render_plan` ends with a per-sample table: cells **before
+gating**, **after gating**, and **after outlier rejection** (one column per property). In the plan,
+show it for the recommended rejection so the user sees what each step removes before answering
+the outlier question: `print(tk.render_cell_counts(tk.reject_outliers(ifxm, method="iqr",
+props=[...], scope="per_sample")))` (and the same for `coulter`). Point out any sample where
+gating or rejection removes an unusually large fraction. The same table goes in the notes (step 6)
+and on the first slide(s) of the main deck (`save_pptx(..., count_tables=...)`, already in the
+template).
 
 **Grid-search heatmaps — suggest, never assume.** If two annotation columns were varied *together*
 across samples (a grid search, e.g. media osmolarity × drug dose), a heatmap of the per-sample mean
@@ -105,10 +114,13 @@ before running it; never skip the question even if the user already approved the
 Behavior to convey: **every** boolean/categorical/approved-ordered column becomes its own grouping
 axis (no cardinality cap — everything is plotted; reorganize on a later pass). Multiple columns are
 handled **independently** by default; cross-products are available on request via `cross_groups`. A
-time column orders samples sequentially and drives timecourses. Gate columns always apply, **ex
-ante**: a paired cell must pass both the mass (`bm_gate`) and volume (`ifxm_gate`) gates before it
-reaches any plot (ridge, box, timecourse, heatmap, scatter, props-vs-time). Missing gate → no
-cutoff; unpaired samples without a volume reading get an empty `vol`.
+time column orders samples sequentially and drives timecourses. **Gating is done upstream**:
+`compile_experiment.py` writes every block already filtered to the AND of all gates in the
+sample's gate file (`mass_pg`, `baseline_norm`, `bl_slope`, `node_dev_mean`, `volume_fl`), so only
+gated cells reach any plot (ridge, box, timecourse, heatmap, scatter, props-vs-time) and the
+plugin does not gate again. A sample with `has_gate = False` was compiled ungated — mention it in
+the plan. Older xlsx files (with `bm_gate_*` / `ifxm_gate_*` columns) are still gated by the
+loaders, the old way. Unpaired samples without a volume reading get an empty `vol`.
 
 **Unpaired runs are supported.** A paired sample uses its matched `pair_` block (unchanged); a
 **mass-only** run (`mass` only) or **volume-only** run (`vol` only) falls back to the standalone
@@ -236,7 +248,8 @@ Every time the skill produces a pptx, write `<EXP_NAME>_analysis_notes.md` **in 
 `<EXP_NAME>_figures.pptx`**, following `references/analysis_notes_template.md`. Its purpose: a
 future run pointed at this analysis (step 0) can read it and recapitulate the analysis on a new
 dataset. Keep it short and factual — only the data-structure details that drive the plotting:
-inputs and sample counts (paired / unpaired), each annotation column with its role, levels and
+inputs and sample counts (paired / unpaired), the per-sample cell-count table the driver prints
+(`render_cell_counts`: before gating / after gating / after outlier rejection), each annotation column with its role, levels and
 any override, how the columns relate (crossed grid, independent, repeated controls, missing
 combos), which plots/axes/pairs were made, and every non-default choice (outlier rejection, axis
 limits, excluded samples, palettes, hand-rolled figures). No prose about results. When the user
@@ -287,11 +300,12 @@ each sample dropped. Low-level keep-masks (`tk.outlier_mask`, `keep_mad`/`keep_i
 are exposed for bespoke logic. (k-sigma/3-std is intentionally not built in — ask if the user wants it.)
 
 ## Gotchas
-- **iFXM gating (ex ante, joint)**: for a paired sample, both loaders apply ONE mask to every prop:
-  `bm_gate` on `pair_mass_pg` AND `ifxm_gate` on `pair_volume_fl` (and all three props finite).
-  So every plot of a paired sample, whether ridge, box, heatmap or scatter, shows the same gated
-  cells. Only unpaired (mass-only / volume-only) samples gate each standalone block on its own
-  gate, because their cells aren't matched. No statistical outlier rejection is applied by the
+- **iFXM gating is upstream**: `compile_experiment.py` gates every block (AND of all five gates)
+  before writing the xlsx; the loaders only drop non-finite values, with ONE row-aligned mask per
+  paired sample, so every plot of it, whether ridge, box, heatmap or scatter, shows the same cells.
+  Legacy xlsx files (`bm_gate_*` / `ifxm_gate_*` columns) are gated by the loaders instead:
+  `bm_gate` on `pair_mass_pg` AND `ifxm_gate` on `pair_volume_fl`, standalone blocks each on their
+  own gate. No statistical outlier rejection is applied by the
   loaders (trimming is the driver's `reject_outliers` call, asked every run). Still use
   `load_ifxm_paired` for `scatter_by` / `props_vs_time` (and pass `paired_records=` to
   `autoplot`): it skips unpaired samples and carries the per-cell `time_h`.
