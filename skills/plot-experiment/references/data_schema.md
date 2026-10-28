@@ -193,8 +193,9 @@ samples only) puts the `props_vs_time` figures in `<exp>_vs_time_fig/` and the d
 
 **Processed data (iFXM, default).** `export_processed` writes
 `processed_data/<exp>_processed.xlsx`, which holds the plotted cells: gated, finite, and after the
-driver's `reject_outliers`. The file uses the `experiment_data.xlsx` layout above, so `load_ifxm`
-reloads it:
+driver's `reject_outliers`. The file uses the `experiment_data.xlsx` layout above, so
+`load_ifxm(<path to the .xlsx>)` reloads it. Pass the file, not the `processed_data/` folder:
+given a folder, the loader looks for `experiment_data.xlsx` inside it.
 - **Sample sheets:** one per sample, with the same `sheet_name`, holding only the property columns
   under their source names. A paired sample has `pair_cell_id`, `pair_mass_pg`, `pair_volume_fl`
   and `pair_cell_density_g_per_mL`, row-aligned. A joint-rejected cell is gone from the whole row.

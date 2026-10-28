@@ -103,7 +103,8 @@ def main() -> None:
     # --- Processed-data export (default, iFXM): exactly the cells the plots show --------------
     # One sheet per sample (same sheet names), pair_cell_id + pair_mass_pg / pair_volume_fl /
     # pair_cell_density_g_per_mL (unpaired: mass_mass_pg / vol_volume_fl), plus metadata + README
-    # sheets. Pass the load_ifxm records after reject_outliers. Reloads with tk.load_ifxm.
+    # sheets. Pass the load_ifxm records after reject_outliers. Reloads with
+    # tk.load_ifxm(PROCESSED_XLSX), the file path, not its folder.
     if ifxm:
         tk.export_processed(ifxm, COMPILED_DIR, PROCESSED_XLSX)
 

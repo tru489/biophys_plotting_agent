@@ -327,7 +327,9 @@ same sheet name. A paired sample's sheet holds `pair_cell_id`, `pair_mass_pg`, `
 from the whole row. An unpaired sample's sheet holds `mass_mass_pg` and/or `vol_volume_fl`. The
 workbook also has a `metadata` sheet (the source rows plus `n_<block>_after_outlier_rejection`)
 and a `README` sheet (source, date, outlier spec). It must get the `load_ifxm` records **after**
-rejection. If rejection was declined, it holds the gated cells. It reloads with `tk.load_ifxm`.
+rejection. If rejection was declined, it holds the gated cells. It reloads with
+`tk.load_ifxm(<path to the .xlsx>)`. Pass the file, not the `processed_data/` folder, because a
+folder makes the loader look for `experiment_data.xlsx`.
 Coulter data is not exported. Keep the block unless the user says to skip it.
 
 Notes: always clean both iFXM record sets with the same spec. `load_ifxm_paired` records are

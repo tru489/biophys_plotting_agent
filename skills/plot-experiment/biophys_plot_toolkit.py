@@ -1868,7 +1868,9 @@ def _export_blocks(r) -> list:
 
 def export_processed(records, compiled_dir, out_path) -> Path:
     """Write the plotted iFXM cells to `out_path` (an .xlsx; parent dirs created) in the same layout
-    as experiment_data.xlsx, so the file reloads with load_ifxm / load_ifxm_paired:
+    as experiment_data.xlsx, so the file reloads with load_ifxm / load_ifxm_paired given the xlsx
+    FILE path (e.g. load_ifxm(out_path)), not its folder: a folder argument makes the loader look
+    for experiment_data.xlsx inside it.
 
       * one worksheet per sample (same `sheet_name`) holding only the mass / volume / density
         columns under their original names — a paired sample's `pair_` block (pair_cell_id,
@@ -1939,6 +1941,8 @@ def export_processed(records, compiled_dir, out_path) -> Path:
             ("metadata", "Source metadata rows of the exported samples; "
                          "n_<block>_after_outlier_rejection = cells written per block."),
             ("samples", f"{len(written)}"),
+            ("reload", f'tk.load_ifxm(r"{out_path.resolve()}")  (pass this file path, not its '
+                       f'folder: a folder makes the loader look for experiment_data.xlsx)'),
         ]
         pd.DataFrame(readme, columns=["field", "value"]).to_excel(
             xw, sheet_name="README", index=False)
