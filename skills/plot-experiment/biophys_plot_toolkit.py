@@ -1105,14 +1105,22 @@ def draw_ridge(ax, arrays, labels, colors, xlabel, overlap: float = 1.7) -> None
     ax._right_margin = 0.07
 
 
-def draw_boxes(ax, arrays, labels, colors, ylabel, sep_keys=None, sep_label_fn=None) -> None:
-    """Boxplot + jittered datapoints, one box per array. Optional run separators under the axis."""
+BOX_WHIS = (5, 95)  # whiskers at the 5th / 95th percentile of the plotted (post-rejection) data
+
+
+def draw_boxes(ax, arrays, labels, colors, ylabel, sep_keys=None, sep_label_fn=None,
+               whis=BOX_WHIS) -> None:
+    """Boxplot + jittered datapoints, one box per array. Optional run separators under the axis.
+
+    Box = Q1–Q3, line = median, whiskers = `whis` percentiles (default 5th/95th) of each array as
+    plotted, i.e. after any reject_outliers trimming. Every point is still drawn as jitter, so
+    points beyond the caps are kept data (the outer 5% tails), not flagged outliers."""
     n = len(arrays)
     for i, (vals, c) in enumerate(zip(arrays, colors)):
         jitter = np.random.uniform(-0.18, 0.18, len(vals))
         ax.scatter(np.full(len(vals), i, float) + jitter, vals,
                    color=c, alpha=0.1, s=4, zorder=2, linewidths=0)
-        ax.boxplot(vals, positions=[i], widths=0.5, patch_artist=True, showfliers=False,
+        ax.boxplot(vals, positions=[i], widths=0.5, whis=whis, patch_artist=True, showfliers=False,
                    boxprops=dict(facecolor=c, alpha=0.5),
                    medianprops=dict(color="black", linewidth=1.5),
                    whiskerprops=dict(color=c), capprops=dict(color=c))

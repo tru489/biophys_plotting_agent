@@ -181,6 +181,12 @@ loudly rather than silently falling back.
    `reject_outliers` lines the user chose in step 2 (none if they declined); beyond that, tame a
    heavy tail with axis limits in the driver.
 
+**Box plot definition (default, automatic):** box = Q1–Q3, line = median, whiskers = 5th and
+95th percentile of each sample's plotted cells (i.e. after outlier rejection, so with the default
+Tukey trim they are percentiles of the Tukey-trimmed data). All kept cells are also drawn as
+jittered points, so points past the caps are the outer 5% tails, not outliers. State this when
+describing box plots in the analysis notes.
+
 **Axis-label convention (default, automatic — general principle, not just this dataset):**
 never repeat on a per-sample tick something the figure already states via its title or its bold
 group separators. Every box plot's per-sample x-tick shows only the annotation columns *not*
@@ -278,7 +284,9 @@ enumerating the full spec, then wire the answer into the driver. Ask for:
 1. **Which properties** to clean — any of coulter `volume`; iFXM `mass` / `density` / `vol`
    (multi-select; can differ per property).
 2. **Method** (per property allowed): `mad` (modified z-score, robust — best for density),
-   `iqr` (Tukey fences, robust, matches the box whiskers), `percentile` (fixed-fraction tail clip).
+   `iqr` (Tukey fences, robust — the default), `percentile` (fixed-fraction tail clip).
+   (Box whiskers are independent of this: they always mark the 5th/95th percentile of the data
+   left after rejection — `tk.BOX_WHIS`, overridable via `draw_boxes(whis=…)`.)
 3. **Scope**: `per_sample` (each sample trimmed on its own stats — default) or `pooled` (one
    global cutoff across all cells).
 4. **Log-space?** (`log=True`) — for log-normal mass/volume so the high tail isn't over-trimmed.
