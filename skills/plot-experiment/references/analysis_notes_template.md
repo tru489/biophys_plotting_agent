@@ -32,6 +32,7 @@ any sample with has_gate = False (compiled ungated) or an unusually large drop. 
 - `GRID_PAIRS`: `[...]` (show_repeats?) — or none
 - Cross-products (`cross_groups`), facets, hand-rolled figures: …
 - Props-vs-time deck (`<EXP_NAME>_props_vs_time.pptx`): samples, props, trend — or skipped (why)
+- Processed data (`processed_data/<EXP_NAME>_processed.xlsx`): plotted iFXM cells, per sample — or skipped (why)
 
 ## Customizations & data handling
 - Outlier rejection: none / `reject_outliers(...)` spec

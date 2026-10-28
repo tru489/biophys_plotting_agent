@@ -191,6 +191,21 @@ samples only) puts the `props_vs_time` figures in `<exp>_vs_time_fig/` and the d
 {datatype}_{prop1-prop2-...}_vs_time_{slug(sample)}.png  # props_vs_time (per sample, default; in <exp>_vs_time_fig/)
 ```
 
+**Processed data (iFXM, default).** `export_processed` writes
+`processed_data/<exp>_processed.xlsx`, which holds the plotted cells: gated, finite, and after the
+driver's `reject_outliers`. The file uses the `experiment_data.xlsx` layout above, so `load_ifxm`
+reloads it:
+- **Sample sheets:** one per sample, with the same `sheet_name`, holding only the property columns
+  under their source names. A paired sample has `pair_cell_id`, `pair_mass_pg`, `pair_volume_fl`
+  and `pair_cell_density_g_per_mL`, row-aligned. A joint-rejected cell is gone from the whole row.
+  An unpaired sample has `mass_mass_pg` and/or `vol_volume_*`, side by side with a blank spacer.
+- **`metadata`:** the source rows plus `n_<block>_after_outlier_rejection`, which is structural.
+- **`README`:** source, date and outlier spec.
+
+Loader records carry the provenance this needs: `sheet`, `columns` (prop → source column), and
+for paired samples a row-aligned `cell_id` that `reject_outliers` trims with the props. Blocks over
+Excel's row limit spill to `{sheet}_{prefix}_overflow.csv` beside the xlsx.
+
 - `datatype` ∈ {`coulter`, `ifxm`}
 - `prop` ∈ {`volume`} (coulter) / {`mass`, `density`, `vol`} (ifxm)
 - `col` / `value` are whatever grouping column and value were used (`is_activated=yes`, `media=rpmi`, …)

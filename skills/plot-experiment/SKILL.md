@@ -216,7 +216,8 @@ Run the driver. It writes PNGs to `<exp>_fig/` (see the naming grid in `data_sch
 `{datatype}_{propY}_vs_{propX}[_{col}={value}].png`, `{datatype}_{prop}_heatmap_{colX}-x-{colY}.png`,
 plus `<exp>_figures.pptx` (with `<exp>` the dated analysis dir name), and — for iFXM with paired
 samples — the per-sample `{datatype}_{props}_vs_time_{sample}.png` figures in `<exp>_vs_time_fig/`
-compiled into `<exp>_props_vs_time.pptx`. You then write
+compiled into `<exp>_props_vs_time.pptx`, and (iFXM) the plotted cells to
+`processed_data/<exp>_processed.xlsx` (see "Processed-data export" below). You then write
 `<exp>_analysis_notes.md` beside the pptx (step 6).
 
 **Point counts (automatic):** every ridge row shows its `n=` (number of points plotted) in small
@@ -317,6 +318,18 @@ ifxm        = tk.reject_outliers(ifxm, **spec)
 ifxm_paired = tk.reject_outliers(ifxm_paired, **spec)
 coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"])
 ```
+**Processed-data export (default, iFXM — do not ask).** The template's
+`tk.export_processed(ifxm, COMPILED_DIR, PROCESSED_XLSX)` runs right after the `reject_outliers`
+lines and writes `processed_data/<EXP_NAME>_processed.xlsx` (in `OUT_ROOT`, beside the decks): the
+cells the plots show, in `experiment_data.xlsx`'s layout. Each sample gets one sheet, under the
+same sheet name. A paired sample's sheet holds `pair_cell_id`, `pair_mass_pg`, `pair_volume_fl` and
+`pair_cell_density_g_per_mL`, one row per kept cell, so a cell removed by the joint trim is gone
+from the whole row. An unpaired sample's sheet holds `mass_mass_pg` and/or `vol_volume_fl`. The
+workbook also has a `metadata` sheet (the source rows plus `n_<block>_after_outlier_rejection`)
+and a `README` sheet (source, date, outlier spec). It must get the `load_ifxm` records **after**
+rejection. If rejection was declined, it holds the gated cells. It reloads with `tk.load_ifxm`.
+Coulter data is not exported. Keep the block unless the user says to skip it.
+
 Notes: always clean both iFXM record sets with the same spec. `load_ifxm_paired` records are
 always trimmed jointly, even with `joint=False`, so scatter rows stay aligned. `verbose=True`
 prints how many cells each sample dropped. Low-level keep-masks (`tk.outlier_mask`, `keep_mad`/`keep_iqr`/`keep_percentile`)

@@ -42,6 +42,9 @@ PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_figures.pptx"
 # own fig dir so it doesn't mix into the main deck. iFXM paired samples only.
 TIME_FIG_DIR  = OUT_ROOT / f"{EXP_NAME}_vs_time_fig"
 TIME_PPTX_OUT = OUT_ROOT / f"{EXP_NAME}_props_vs_time.pptx"
+# Default export (iFXM): the plotted cells (gated + post-outlier-rejection) as an xlsx in
+# experiment_data.xlsx's layout — one sheet per sample, mass / volume / density columns only.
+PROCESSED_XLSX = OUT_ROOT / "processed_data" / f"{EXP_NAME}_processed.xlsx"
 # Claude writes OUT_ROOT / f"{EXP_NAME}_analysis_notes.md" next to the deck (data structure +
 # plotting choices) so a future dataset can be analyzed the same way.
 
@@ -96,6 +99,13 @@ def main() -> None:
     #   ifxm        = tk.reject_outliers(ifxm, **OUTLIER_SPEC)
     #   ifxm_paired = tk.reject_outliers(ifxm_paired, **OUTLIER_SPEC)
     #   coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"], scope="per_sample")
+
+    # --- Processed-data export (default, iFXM): exactly the cells the plots show --------------
+    # One sheet per sample (same sheet names), pair_cell_id + pair_mass_pg / pair_volume_fl /
+    # pair_cell_density_g_per_mL (unpaired: mass_mass_pg / vol_volume_fl), plus metadata + README
+    # sheets. Pass the load_ifxm records after reject_outliers. Reloads with tk.load_ifxm.
+    if ifxm:
+        tk.export_processed(ifxm, COMPILED_DIR, PROCESSED_XLSX)
 
     # --- iFXM: inspect the annotation schema, show the plan, run it -----------------------
     if ifxm:

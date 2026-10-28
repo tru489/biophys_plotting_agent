@@ -253,6 +253,7 @@ _VOL_UNCAL = "volume_au"        # legacy VOLUME block uncalibrated (AU) -> 'vol_
 # Calibrated (fL) VOLUME column, in preference order: current CELLGROUPED-hdf5 'vol_volume_fl',
 # then the legacy *_ProcessedVolumes 'vol_volume_fL'.
 _VOL_CALS  = ("volume_fl", "volume_fL")
+_CELL_ID = "cell_id"            # PAIRED block per-cell id -> 'pair_cell_id' (kept for export)
 
 
 def _find_coulter_data_csv(d: Path, meta_path: Path) -> Path:
@@ -466,15 +467,23 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                 }
                 counts = [_cell_count("paired", _ungated("paired", mass.size), mask.sum(),
                                       ["mass", "density", "vol"])]
+                # Provenance for export_processed: the sheet, source columns and per-cell ids
+                # (row-aligned with the props; reject_outliers trims them with the same mask).
+                src = {"sheet": r[skey], "columns": {"mass": f"pair_{_PAIR_MASS}",
+                                                     "vol": f"pair_{_PAIR_VOL}",
+                                                     "density": f"pair_{_PAIR_DENS}"}}
+                if _CELL_ID in pair.columns:
+                    src["cell_id"] = pair[_CELL_ID].to_numpy()[mask]
+                    src["cell_id_column"] = f"pair_{_CELL_ID}"
                 if paired:
                     t = _pair_time_h(_read_block(xls, xlsx, r[skey], "mass", cache), mass)
                     recs.append({"sample": sample, "props": props, "meta": meta_bag,
                                  "time_h": t[mask], "cell_counts": counts,
-                                 "row_aligned": True})
+                                 "row_aligned": True, **src})
                     continue
                 # props are one row per cell: reject_outliers trims them with one joint mask
                 recs.append({"sample": sample, "props": props, "meta": meta_bag,
-                             "cell_counts": counts, "row_aligned": True})
+                             "cell_counts": counts, "row_aligned": True, **src})
                 continue
             else:
                 # Unpaired sample (mass-only / volume-only): fall back to the standalone blocks.
@@ -488,10 +497,14 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                     if massblk is not None and _MASS_STANDALONE in massblk.columns else _EMPTY
                 # Single `vol` prop: prefer a calibrated (fL) reading, else the uncalibrated (AU) one.
                 vol = _EMPTY
+                columns = {}
+                if mass.size:
+                    columns["mass"] = f"mass_{_MASS_STANDALONE}"
                 if volblk is not None:
                     for c in (*_VOL_CALS, _VOL_UNCAL):
                         if c in volblk.columns:
                             vol = volblk[c].to_numpy(dtype=float)
+                            columns["vol"] = f"vol_{c}"
                             break
 
                 bm_mask = np.isfinite(mass) & (mass >= bm_lo) & (mass <= bm_hi)
@@ -509,7 +522,7 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                     counts.append(_cell_count("volume", _ungated("volume", vol.size),
                                               props["vol"].size, ["vol"]))
             recs.append({"sample": sample, "props": props, "meta": meta_bag,
-                         "cell_counts": counts})
+                         "cell_counts": counts, "sheet": r[skey], "columns": columns})
     return recs
 
 
@@ -625,6 +638,9 @@ def keep_percentile(a, lower=1.0, upper=99.0, *, log=False, ref=None):
     return outlier_mask(a, "percentile", log=log, ref=ref, lower=lower, upper=upper)
 
 
+_ROW_EXTRAS = ("time_h", "cell_id")   # per-cell record arrays kept row-aligned with the props
+
+
 def reject_outliers(records, method="iqr", *, props=None, joint=True, paired=False,
                     scope="per_sample", log=False, params=None, bounds_from=None,
                     verbose=False) -> list:
@@ -638,7 +654,7 @@ def reject_outliers(records, method="iqr", *, props=None, joint=True, paired=Fal
     joint  : True (default) — for a row-aligned record (an iFXM paired sample, from either loader)
              every selected prop's cutoffs are computed ONCE from the untrimmed cells, the keep-masks
              are AND-combined (a cell outside ANY prop's cutoffs is dropped), and that one mask is
-             applied to EVERY prop (and `time_h`). So a cell rejected on mass is gone from the
+             applied to EVERY prop (and `time_h` / `cell_id`). So a cell rejected on mass is gone from the
              volume and density plots too, and load_ifxm / load_ifxm_paired records trimmed with the
              same spec hold identical cells. Single pass: cutoffs are not recomputed after the
              joint trim. Records that aren't row-aligned (unpaired mass-only / volume-only samples,
@@ -717,9 +733,11 @@ def reject_outliers(records, method="iqr", *, props=None, joint=True, paired=Fal
                 newprops[p] = a[keep] if a.size == length else a
             if verbose:
                 print(f"  reject[{r['sample']}] paired: {length - int(keep.sum())}/{length} rows")
-            if "time_h" in r and np.asarray(r["time_h"]).size == length:
-                out.append({**r, "props": newprops, "time_h": np.asarray(r["time_h"])[keep]})
-                continue
+            # per-cell extras row-aligned with the props get the same mask
+            extras = {k: np.asarray(r[k])[keep] for k in _ROW_EXTRAS
+                      if k in r and np.asarray(r[k]).size == length}
+            out.append({**r, "props": newprops, **extras})
+            continue
         else:
             for p in sel:
                 a = np.asarray(r["props"].get(p, []), float)
@@ -743,6 +761,7 @@ STRUCTURAL_PATTERNS = [re.compile(p) for p in (
     r"^gate_",                                 # gate_<attr>_lower / _upper (compile_experiment)
     r"^n_\w+_(un)?gated$",                     # per-block cell counts before / after gating
                                                # (mass/paired/volume, vqvae, any future block)
+    r"^n_\w+_after_outlier_rejection$",        # export_processed's metadata counts
     r"_gate_lower$", r"_gate_upper$", r"^bm_gate", r"^ifxm_gate")]   # legacy gate columns
 IDENTITY_COLS = {"sample_name"}
 
@@ -1817,6 +1836,114 @@ def render_cell_counts(records, title="Cells per sample") -> str:
     lines += ["| " + " | ".join(cells) + " |" for cells in body]
     lines.append(caption)
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Processed-data export — the plotted cells, in experiment_data.xlsx's layout
+# ---------------------------------------------------------------------------
+_EXCEL_MAX_ROWS = 1_048_576 - 1   # data rows below the header
+_BLOCK_PROPS = {"paired": ("mass", "vol", "density"), "mass": ("mass",), "volume": ("vol",)}
+_BLOCK_PREFIX = {"paired": "pair", "mass": "mass", "volume": "vol"}
+
+
+def _export_blocks(r) -> list:
+    """[(block, prefix, DataFrame)] for one load_ifxm record: its kept cells, with the source
+    column names (pair_cell_id + pair_mass_pg / pair_volume_fl / pair_cell_density_g_per_mL for a
+    paired sample; mass_mass_pg and/or vol_volume_* for an unpaired one)."""
+    cols = r.get("columns") or {}
+    out = []
+    for c in r.get("cell_counts") or []:
+        block = c["block"]
+        props = [p for p in _BLOCK_PROPS.get(block, ()) if p in cols]
+        if not props:
+            continue
+        data = {}
+        if block == "paired" and "cell_id" in r:
+            data[r.get("cell_id_column", f"pair_{_CELL_ID}")] = np.asarray(r["cell_id"])
+        for p in props:
+            data[cols[p]] = np.asarray(r["props"][p], float)
+        out.append((block, _BLOCK_PREFIX[block], pd.DataFrame(data)))
+    return out
+
+
+def export_processed(records, compiled_dir, out_path) -> Path:
+    """Write the plotted iFXM cells to `out_path` (an .xlsx; parent dirs created) in the same layout
+    as experiment_data.xlsx, so the file reloads with load_ifxm / load_ifxm_paired:
+
+      * one worksheet per sample (same `sheet_name`) holding only the mass / volume / density
+        columns under their original names — a paired sample's `pair_` block (pair_cell_id,
+        pair_mass_pg, pair_volume_fl, pair_cell_density_g_per_mL; one row per kept cell), an
+        unpaired sample's `mass_mass_pg` and/or `vol_volume_*` (side by side, one blank spacer
+        column between blocks). A block over Excel's row limit is written in full to
+        '{sheet}_{prefix}_overflow.csv' beside the xlsx and truncated in the sheet.
+      * 'metadata' — the source metadata rows of the exported samples, plus
+        n_<block>_after_outlier_rejection (cells written per block).
+      * 'README' — source, date, and the outlier rejection applied.
+
+    Pass the load_ifxm records AFTER reject_outliers (the ones the ridge / box plots use), so the
+    file holds exactly the plotted cells: gated upstream, finite, and — with the default joint
+    rejection — a paired cell dropped on any prop is absent from the whole row. Without
+    reject_outliers it holds the gated cells. load_ifxm_paired records would omit unpaired samples."""
+    from datetime import datetime
+
+    xlsx = _open_ifxm_xlsx(compiled_dir)
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    meta = pd.read_excel(xlsx, sheet_name="metadata")
+    skey = "sheet_name" if "sheet_name" in meta.columns else "sample_name"
+
+    written, counts = [], {}
+    with pd.ExcelWriter(out_path, engine="openpyxl") as xw:
+        sheets = []
+        for r in records:
+            sheet = r.get("sheet")
+            blocks = _export_blocks(r)
+            if sheet is None or not blocks:
+                continue
+            sheets.append((str(sheet), blocks))
+            for block, _, df in blocks:
+                counts[(str(sheet), block)] = len(df)
+        # metadata first, matching experiment_data.xlsx
+        keep = [str(s) for s, _ in sheets]
+        m = meta[meta[skey].astype(str).isin(keep)].copy()
+        for block in dict.fromkeys(b for (_, b) in counts):
+            m[f"n_{block}_after_outlier_rejection"] = [
+                counts.get((str(s), block), np.nan) for s in m[skey]]
+        m.to_excel(xw, sheet_name="metadata", index=False)
+
+        for sheet, blocks in sheets:
+            col = 0
+            for _, prefix, df in blocks:
+                if len(df) > _EXCEL_MAX_ROWS:
+                    df.to_csv(out_path.parent / f"{sheet}_{prefix}_overflow.csv", index=False)
+                    df = df.iloc[:_EXCEL_MAX_ROWS]
+                df.to_excel(xw, sheet_name=sheet, index=False, startcol=col)
+                col += df.shape[1] + 1   # one blank spacer column between blocks
+            written.append(sheet)
+
+        specs = list(dict.fromkeys(s for r in records for s in r.get("outlier_rejection", [])))
+        readme = [
+            ("source", str(xlsx)),
+            ("generated", datetime.now().strftime("%Y-%m-%d %H:%M")),
+            ("contents", "Per-cell mass / volume / density of the cells shown in the figures: "
+                         "gated upstream by compile_experiment.py, non-finite values dropped, "
+                         "then outlier rejection as below."),
+            ("outlier rejection", " | ".join(specs) if specs else "none applied"),
+            ("joint rejection", "Paired samples (pair_ block): one row per cell, a cell outside "
+                                "any selected property's cutoffs is removed from the whole row. "
+                                "Unpaired mass-only / volume-only samples: trimmed on their one "
+                                "property."),
+            ("columns", "pair_cell_id, pair_mass_pg (pg), pair_volume_fl (fL), "
+                        "pair_cell_density_g_per_mL (absolute, g/mL); unpaired: mass_mass_pg, "
+                        "vol_volume_fl (or legacy vol_volume_fL / vol_volume_au)."),
+            ("metadata", "Source metadata rows of the exported samples; "
+                         "n_<block>_after_outlier_rejection = cells written per block."),
+            ("samples", f"{len(written)}"),
+        ]
+        pd.DataFrame(readme, columns=["field", "value"]).to_excel(
+            xw, sheet_name="README", index=False)
+    print(f"  processed data: {len(written)} samples -> {out_path}")
+    return out_path
 
 
 # ---------------------------------------------------------------------------
