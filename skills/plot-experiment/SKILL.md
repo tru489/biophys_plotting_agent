@@ -81,7 +81,8 @@ anything via `overrides={col: "ordered"|"categorical"|...}`.
 gating**, **after gating**, and **after outlier rejection** (one column per property). In the plan,
 show it for the recommended rejection so the user sees what each step removes before answering
 the outlier question: `print(tk.render_cell_counts(tk.reject_outliers(ifxm, method="iqr",
-props=[...], scope="per_sample")))` (and the same for `coulter`). Point out any sample where
+props=[...], scope="per_sample")))` (and the same for `coulter`). With the default joint trim, a
+paired sample's per-property columns are all equal. Point out any sample where
 gating or rejection removes an unusually large fraction. The same table goes in the notes (step 6)
 and on the first slide(s) of the main deck (`save_pptx(..., count_tables=...)`, already in the
 template).
@@ -172,7 +173,7 @@ loudly rather than silently falling back.
      template's block for every iFXM experiment with paired samples (skip it only if the user
      says to). Defaults: every paired sample, mass/vol/density, `trend="binned_median"`. **Pass
      `load_ifxm_paired` records** — they carry the per-cell `time_h` (matched from the mass_
-     block's `peak_time_h`), which `reject_outliers(paired=True)` keeps aligned, so the outlier
+     block's `peak_time_h`), which `reject_outliers` keeps aligned, so the outlier
      choice from step 2 applies here too. `trend`: `"binned_median"` (`bins=30`),
      `"rolling_mean"` (moving average) or `"rolling_median"` (`window=` cells, default ~n/30), or
      `None`. x-axis auto-switches to minutes for runs under 1 h (`time_unit=`). Narrow
@@ -268,14 +269,27 @@ The loaders apply **no statistical outlier rejection** — data is loaded verbat
 happens only through the explicit `reject_outliers` transform in the driver, which returns cleaned
 records feeding straight into `build_plan`/`autoplot`/any combinator, so one call cleans every
 downstream plot. Step 2 always asks the user whether to use it (recommended default: Tukey fences,
-per sample, on mass/volume/density):
+per sample, on mass/volume/density, **joint across properties**):
 ```python
-ifxm_paired = tk.reject_outliers(ifxm_paired, method="iqr", props=["mass", "density", "vol"],
-                                 scope="per_sample", paired=True, bounds_from=ifxm)    # scatter
-ifxm        = tk.reject_outliers(ifxm, method="iqr", props=["mass", "density", "vol"], scope="per_sample")
+OUTLIER_SPEC = dict(method="iqr", props=["mass", "density", "vol"], scope="per_sample")
+ifxm        = tk.reject_outliers(ifxm, **OUTLIER_SPEC)          # ridge / box / heatmap / timecourse
+ifxm_paired = tk.reject_outliers(ifxm_paired, **OUTLIER_SPEC)   # scatter / props-vs-time
 coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"], scope="per_sample")
 ```
 (Trim `props` to the properties that exist.)
+
+**Joint trimming (default, `joint=True`).** For each paired sample, the Tukey fence of every
+selected property is computed once from the untrimmed (gated) cells. A cell outside **any** fence
+is dropped from **every** property, so a cell rejected on mass is also absent from the volume and
+density plots. Every plot of that sample (ridge, box, heatmap, timecourse, scatter, props-vs-time)
+and its cell count show the same cells. This is a single pass: fences are not recomputed after
+the joint trim. Density gets its own fence even though it's derived from mass and volume. Because
+of the joint trim, a property's plotted distribution can lose cells from its interior, not just
+from beyond its own fence. Unpaired mass-only / volume-only samples (and Coulter) have one property
+per cell, so they are trimmed on that property alone. Both iFXM record sets get the same spec and
+so the same mask; `bounds_from` is no longer needed. Use `joint=False` only if the user explicitly
+asks for each property to be trimmed independently. Scatter records stay joint either way, so the
+scatter rows stay aligned.
 
 **If the user picks "customize", or brings up outlier rejection later** (e.g. "trim the density
 tails", "reject outliers on volume"), do **not** guess — present a menu with `AskUserQuestion`
@@ -289,22 +303,23 @@ enumerating the full spec, then wire the answer into the driver. Ask for:
    left after rejection — `tk.BOX_WHIS`, overridable via `draw_boxes(whis=…)`.)
 3. **Scope**: `per_sample` (each sample trimmed on its own stats — default) or `pooled` (one
    global cutoff across all cells).
-4. **Log-space?** (`log=True`) — for log-normal mass/volume so the high tail isn't over-trimmed.
-5. **Method params** if they care — `mad thresh` (3.5), `iqr k` (1.5), `percentile lower/upper`
+4. **Joint or independent**: `joint=True` (default — a paired cell outside any property's cutoff
+   is dropped from all properties' plots) or `joint=False` (each property's ridges/boxes trimmed
+   on its own cutoff only).
+5. **Log-space?** (`log=True`) — for log-normal mass/volume so the high tail isn't over-trimmed.
+6. **Method params** if they care — `mad thresh` (3.5), `iqr k` (1.5), `percentile lower/upper`
    (1/99).
 
 Then add lines to the driver (and re-run):
 ```python
 spec = dict(method={"density": "mad", "mass": "iqr"}, scope="per_sample")
-ifxm_paired = tk.reject_outliers(ifxm_paired, **spec, paired=True, bounds_from=ifxm)  # scatter
 ifxm        = tk.reject_outliers(ifxm, **spec)
+ifxm_paired = tk.reject_outliers(ifxm_paired, **spec)
 coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"])
 ```
-Notes: clean the **scatter** records (`ifxm_paired`) with the same spec, `paired=True` (a cell's
-props stay row-aligned) and `bounds_from=<untrimmed ifxm>`, so scatters use exactly the cutoffs
-of the ridges/boxes. Clean them before reassigning `ifxm`. A paired cell is still dropped from
-scatters if *any* of its props falls outside its cutoff, which keeps the rows aligned. `verbose=True` prints how many cells
-each sample dropped. Low-level keep-masks (`tk.outlier_mask`, `keep_mad`/`keep_iqr`/`keep_percentile`)
+Notes: always clean both iFXM record sets with the same spec. `load_ifxm_paired` records are
+always trimmed jointly, even with `joint=False`, so scatter rows stay aligned. `verbose=True`
+prints how many cells each sample dropped. Low-level keep-masks (`tk.outlier_mask`, `keep_mad`/`keep_iqr`/`keep_percentile`)
 are exposed for bespoke logic. (k-sigma/3-std is intentionally not built in — ask if the user wants it.)
 
 ## Gotchas

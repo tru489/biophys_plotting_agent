@@ -85,15 +85,16 @@ def main() -> None:
     print(f"  coulter samples: {len(coulter)} | ifxm samples: {len(ifxm)}")
 
     # --- Outlier rejection (Claude asks each run; data is loaded verbatim otherwise) -------
-    # Recommended default: Tukey fences, per sample, on mass/density/vol (+ coulter volume). One
-    # call cleans every downstream plot. method 'mad'|'iqr'|'percentile' (per-prop dict allowed);
-    # scope 'per_sample'|'pooled'; log=True for log-normal mass/volume. Clean the paired records
-    # with paired=True (rows stay aligned) and bounds_from=<untrimmed ifxm> (same cutoffs as the
-    # ridges/boxes) — so clean them BEFORE reassigning `ifxm`. Delete these lines if declined.
-    #   ifxm_paired = tk.reject_outliers(ifxm_paired, method="iqr", props=["mass", "density", "vol"],
-    #                                    scope="per_sample", paired=True, bounds_from=ifxm)
-    #   ifxm        = tk.reject_outliers(ifxm, method="iqr", props=["mass", "density", "vol"],
-    #                                    scope="per_sample")
+    # Recommended default: Tukey fences, per sample, on mass/density/vol (+ coulter volume),
+    # JOINT across props (default joint=True): a paired cell outside ANY prop's fence is dropped
+    # from every plot, so all of a sample's plots show the same cells. Single pass — fences come
+    # from the untrimmed cells. Unpaired mass-only / volume-only samples are trimmed on their one
+    # prop. Apply the same spec to both iFXM record sets (they hold identical paired cells, so
+    # they get identical masks). method 'mad'|'iqr'|'percentile' (per-prop dict allowed);
+    # scope 'per_sample'|'pooled'; log=True for log-normal mass/volume. Delete if declined.
+    #   OUTLIER_SPEC = dict(method="iqr", props=["mass", "density", "vol"], scope="per_sample")
+    #   ifxm        = tk.reject_outliers(ifxm, **OUTLIER_SPEC)
+    #   ifxm_paired = tk.reject_outliers(ifxm_paired, **OUTLIER_SPEC)
     #   coulter     = tk.reject_outliers(coulter, method="iqr", props=["volume"], scope="per_sample")
 
     # --- iFXM: inspect the annotation schema, show the plan, run it -----------------------

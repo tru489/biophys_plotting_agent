@@ -469,8 +469,13 @@ def _load_ifxm_records(compiled_dir, sample_col, sheet_col, gate_cols,
                 if paired:
                     t = _pair_time_h(_read_block(xls, xlsx, r[skey], "mass", cache), mass)
                     recs.append({"sample": sample, "props": props, "meta": meta_bag,
-                                 "time_h": t[mask], "cell_counts": counts})
+                                 "time_h": t[mask], "cell_counts": counts,
+                                 "row_aligned": True})
                     continue
+                # props are one row per cell: reject_outliers trims them with one joint mask
+                recs.append({"sample": sample, "props": props, "meta": meta_bag,
+                             "cell_counts": counts, "row_aligned": True})
+                continue
             else:
                 # Unpaired sample (mass-only / volume-only): fall back to the standalone blocks.
                 # Their cells aren't matched, so (legacy files) each block takes only its own gate.
@@ -620,8 +625,9 @@ def keep_percentile(a, lower=1.0, upper=99.0, *, log=False, ref=None):
     return outlier_mask(a, "percentile", log=log, ref=ref, lower=lower, upper=upper)
 
 
-def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="per_sample",
-                    log=False, params=None, bounds_from=None, verbose=False) -> list:
+def reject_outliers(records, method="iqr", *, props=None, joint=True, paired=False,
+                    scope="per_sample", log=False, params=None, bounds_from=None,
+                    verbose=False) -> list:
     """Return NEW records with outliers removed from the selected props. OPT-IN — nothing is
     trimmed unless you call this; the returned list feeds straight into build_plan / autoplot /
     any combinator, so one call cleans every downstream plot.
@@ -629,17 +635,25 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
     method : a method name for all selected props, or a dict {prop: method} (e.g.
              {"density": "mad", "mass": "iqr"}). See outlier_mask for methods/params.
     props  : which props to clean (default: every prop present). e.g. ["density"], ["mass","vol"].
+    joint  : True (default) — for a row-aligned record (an iFXM paired sample, from either loader)
+             every selected prop's cutoffs are computed ONCE from the untrimmed cells, the keep-masks
+             are AND-combined (a cell outside ANY prop's cutoffs is dropped), and that one mask is
+             applied to EVERY prop (and `time_h`). So a cell rejected on mass is gone from the
+             volume and density plots too, and load_ifxm / load_ifxm_paired records trimmed with the
+             same spec hold identical cells. Single pass: cutoffs are not recomputed after the
+             joint trim. Records that aren't row-aligned (unpaired mass-only / volume-only samples,
+             Coulter) have nothing to cross-reference, so each prop is trimmed on its own cutoffs.
+             False — trim each prop independently (load_ifxm_paired records stay joint regardless,
+             so scatter rows stay aligned).
+    paired : force the joint mask on every record (legacy flag; no longer needed).
     scope  : 'per_sample' (bounds from each sample's own values; default) or 'pooled' (bounds from
              every cell of that prop across all records — one global cutoff).
-    paired : True for row-aligned records (load_ifxm_paired): a keep-mask is built from each
-             selected prop, AND-combined, and applied to EVERY prop (and the per-cell `time_h`) so
-             a cell's values stay aligned.
     log    : compute bounds in log-space (for log-normal mass/volume).
     params : method params applied globally (merged over the method defaults). For different params
              per prop, call reject_outliers once per props subset.
     bounds_from : records to compute the cutoffs from instead of `records` (matched by sample for
-             'per_sample'; all of them for 'pooled'). Pass the UNTRIMMED load_ifxm records when
-             cleaning the paired records, so scatters use exactly the ridge/box cutoffs. A sample
+             'per_sample'; all of them for 'pooled'). Not needed with joint=True (both loaders give a
+             paired sample the same cells, so the same spec gives the same cutoffs). A sample
              missing from bounds_from falls back to its own values.
     verbose: print how many cells/rows each sample dropped (rejection is never silent).
 
@@ -657,6 +671,8 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
         return method[p] if isinstance(method, dict) else method
 
     desc = (", ".join(f"{p}: {meth(p)}" for p in sel) + f"; {scope}"
+            + (("; joint across props (paired cells)" if joint or paired else
+                "; each prop independently") if len(sel) > 1 else "")
             + ("; log-space" if log else "")
             + (f"; {', '.join(f'{k}={v}' for k, v in kw.items())}" if kw else ""))
 
@@ -683,7 +699,8 @@ def reject_outliers(records, method="iqr", *, props=None, paired=False, scope="p
     for r in records:
         newprops = dict(r["props"])
         r = {**r, "outlier_rejection": [*r.get("outlier_rejection", []), desc]}
-        if paired:
+        # load_ifxm_paired records (they carry time_h) are always joint so scatter rows stay aligned
+        if paired or (r.get("row_aligned") and (joint or "time_h" in r)):
             length = next((np.asarray(r["props"][p], float).size for p in sel
                            if np.asarray(r["props"].get(p, []), float).size), None)
             if length is None:
