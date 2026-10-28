@@ -141,7 +141,7 @@ carried into each record's `meta` bag, and `infer_roles(records)` classifies eve
 | `categorical`| other strings (any cardinality — no cap)                | per-value plots + comparison + facet |
 | `continuous` | high-cardinality numeric, no gradient hint              | color / scatter axis only      |
 | `label`      | `sample_name` / unique free text                        | labels only                    |
-| `structural` | `sheet_name`, `hdf5_key`, `has_*`, `gate_*`, `n_(mass\|paired\|volume)_(un)gated`, legacy `*_gate_*`, `coulter_column`, `calibration_factor` | ignored |
+| `structural` | `sheet_name`, `hdf5_key`, `has_*`, `gate_*`, `n_<block>_(un)gated` (any block, e.g. `mass`/`paired`/`volume`/`vqvae`), legacy `*_gate_*`, `coulter_column`, `calibration_factor` | ignored |
 
 Notes:
 - **Booleans** (checkbox columns are literally `yes`/`no`) get the high-contrast, colorblind-safe

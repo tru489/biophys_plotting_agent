@@ -741,7 +741,8 @@ DEFAULT_STRUCTURAL = {"sheet_name", "hdf5_key", "coulter_column", "calibration_f
 STRUCTURAL_PATTERNS = [re.compile(p) for p in (
     r"^has_",
     r"^gate_",                                 # gate_<attr>_lower / _upper (compile_experiment)
-    r"^n_(mass|paired|volume)_(un)?gated$",    # per-block cell counts before / after gating
+    r"^n_\w+_(un)?gated$",                     # per-block cell counts before / after gating
+                                               # (mass/paired/volume, vqvae, any future block)
     r"_gate_lower$", r"_gate_upper$", r"^bm_gate", r"^ifxm_gate")]   # legacy gate columns
 IDENTITY_COLS = {"sample_name"}
 
@@ -971,7 +972,7 @@ _LEGEND_INSIDE_LOCS = ("upper right", "upper left", "lower right", "lower left",
                        "center left", "upper center", "lower center", "center")
 _LEGEND_OUTSIDE = ("center left", (1.0, 0.5))    # (loc, anchor in axes fractions)
 _INK_TOL = 8            # per-channel distance from the background that counts as "something drawn"
-_LEGEND_PAD_PX = 2      # clearance kept around the legend box
+_LEGEND_PAD_PT = 4      # clearance kept around the legend box, in points (so it holds at any dpi)
 
 
 def _ink_mask(ax, leg, renderer) -> np.ndarray:
@@ -1005,7 +1006,9 @@ def _legend_ink(leg, ink, renderer) -> int:
     """How many drawn-feature pixels fall inside the legend's box (plus a small margin)."""
     bb = leg.get_window_extent(renderer)
     h, w = ink.shape
-    pad = _LEGEND_PAD_PX
+    # the check renders at fig.dpi but _save writes at 150 dpi, so a pixel margin would shrink
+    # in the saved PNG; keep the clearance in points instead
+    pad = int(np.ceil(_LEGEND_PAD_PT * renderer.dpi / 72))
     x0, x1 = max(int(np.floor(bb.x0)) - pad, 0), min(int(np.ceil(bb.x1)) + pad, w)
     y0, y1 = max(int(np.floor(h - bb.y1)) - pad, 0), min(int(np.ceil(h - bb.y0)) + pad, h)
     return int(ink[y0:y1, x0:x1].sum()) if x1 > x0 and y1 > y0 else 0
@@ -1048,7 +1051,8 @@ def place_legend(ax, handles=None, labels=None, **kwargs):
         return leg
 
     out_loc, (ox, oy) = _LEGEND_OUTSIDE        # clear anything drawn in the right margin (ridge n=)
-    outside = (out_loc, (ox + getattr(ax, "_right_margin", 0.0), oy))
+    pad_frac = _LEGEND_PAD_PT * fig.dpi / 72 / ax.bbox.width   # and the clearance, off the spine
+    outside = (out_loc, (ox + getattr(ax, "_right_margin", 0.0) + pad_frac, oy))
     candidates = [(loc, None) for loc in _LEGEND_INSIDE_LOCS] + [outside]
     best, best_score = None, None
     for loc, anchor in candidates:
@@ -1719,8 +1723,10 @@ def grid_heatmap(records, prop, label, datatype, fig_dir, *, cols, roles=None, a
     h = max(3.5, 0.85 * len(ys) + 1.8)
     if rep_arr is not None:
         rep_w = max(2.5, 1.4 * rep_arr.shape[1])
-        fig, (ax, axr) = plt.subplots(1, 2, figsize=(grid_w + rep_w + 2.5, h), gridspec_kw=dict(
-            width_ratios=[grid_w, rep_w], wspace=0.35))
+        # constrained layout: the repeat panel's long "x | y" row labels need room between the
+        # panels, which a fixed wspace doesn't give (they ran into the main grid)
+        fig, (ax, axr) = plt.subplots(1, 2, figsize=(grid_w + rep_w + 2.5, h), layout="constrained",
+                                      gridspec_kw=dict(width_ratios=[grid_w, rep_w]))
     else:
         fig, ax = plt.subplots(figsize=(grid_w + 2, h))
         axr = None
